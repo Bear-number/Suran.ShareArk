@@ -1,0 +1,1181 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Net.WebSockets;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Threading;
+using System.Threading.Tasks;
+using Alife.Function.FunctionCaller;
+using Alife.Framework;
+using Microsoft.Extensions.Logging;
+
+namespace Suran.ShareArk;
+
+public class ShareArkConfig
+{
+    [DisplayName("第三方接口基地址")]
+    [Description("填一个第三方签名服务基地址就行，音乐卡/分享卡/歌曲搜索接口地址会自动拼接，如 https://apii.xianyuw.cn/api/v1")]
+    public string BaseUrl { get; set; } = "";
+
+    [DisplayName("接口Token")]
+    [Description("第三方接口凭证key，可留空；咸鱼API到 https://apii.xianyuw.cn 注册后在个人中心获取")]
+    public string ApiKey { get; set; } = "";
+
+    [DisplayName("协议端地址")]
+    [Description("OneBot正向WebSocket地址")]
+    public string WsUrl { get; set; } = "ws://127.0.0.1:3001";
+
+    [DisplayName("音乐卡签名接口地址")]
+    [Description("完整地址，可留空；留空时用基地址自动探测后缀拼出")]
+    public string MusicArkUrl { get; set; } = "";
+
+    [DisplayName("分享卡签名接口地址")]
+    [Description("完整地址，可留空；留空时用基地址自动探测后缀拼出")]
+    public string ShareArkUrl { get; set; } = "";
+
+    [DisplayName("歌曲搜索接口地址")]
+    [Description("完整地址，可留空；留空时用基地址自动探测后缀拼出。可含{pf}占位符，会被替换为163/qq/kugou")]
+    public string SearchUrl { get; set; } = "";
+
+    [DisplayName("B站搜索接口地址")]
+    [Description("B站视频搜索接口完整地址，可留空，留空走B站官方接口。第三方返回需为 {code,data:[{id,title}]} 结构")]
+    public string BiliSearchUrl { get; set; } = "";
+
+    // ── 功能开关：关闭后对应函数对AI不可用（默认全开，老配置缺省即开） ──
+    [DisplayName("开关·搜歌")] [Description("关闭后 SearchMusic 不可用")]
+    public bool EnableSearchMusic { get; set; } = true;
+    [DisplayName("开关·B站搜索")] [Description("关闭后 SearchBili 不可用")]
+    public bool EnableSearchBili { get; set; } = true;
+    [DisplayName("开关·发音乐/视频卡")] [Description("关闭后 SendArkCard 不可用")]
+    public bool EnableSendArkCard { get; set; } = true;
+    [DisplayName("开关·发通用分享卡")] [Description("关闭后 SendShareCard 不可用")]
+    public bool EnableSendShareCard { get; set; } = true;
+    [DisplayName("开关·B站链接解析")] [Description("关闭后 BiliParse 不可用")]
+    public bool EnableBiliParse { get; set; } = true;
+    [DisplayName("开关·B站用户查询")] [Description("关闭后 BiliUserInfo 不可用")]
+    public bool EnableBiliUserInfo { get; set; } = true;
+    [DisplayName("开关·UP主更新查询")] [Description("关闭后 BiliUpdates 不可用")]
+    public bool EnableBiliUpdates { get; set; } = true;
+    [DisplayName("开关·B站热门/相关")] [Description("关闭后 BiliHot 不可用")]
+    public bool EnableBiliHot { get; set; } = true;
+    [DisplayName("开关·B站扫码登录")] [Description("关闭后 BiliQrLogin 不可用")]
+    public bool EnableBiliQrLogin { get; set; } = true;
+    [DisplayName("开关·Cookie刷新")] [Description("关闭后 BiliCookieRefresh 不可用")]
+    public bool EnableBiliCookieRefresh { get; set; } = true;
+    [DisplayName("开关·Cookie管理")] [Description("关闭后 BiliCookie 不可用")]
+    public bool EnableBiliCookie { get; set; } = true;
+    [DisplayName("开关·IP查询")] [Description("关闭后 IpLookup 不可用")]
+    public bool EnableIpLookup { get; set; } = true;
+    [DisplayName("开关·探测接口")] [Description("关闭后 ProbeBase 不可用")]
+    public bool EnableProbeBase { get; set; } = true;
+    [DisplayName("开关·列出全部接口")] [Description("关闭后 ProbeAll 不可用")]
+    public bool EnableProbeAll { get; set; } = true;
+}
+
+[Module("QQ分享卡片",
+    "自己完成音乐卡与通用分享卡签名并直塞协议端，不依赖协议端的签名地址配置",
+    defaultCategory: "苏染的工具",
+    EditorUI = typeof(ShareArkUI))]
+public class ShareArkModule(
+    XmlFunctionCaller functionCaller,
+    ILogger<ShareArkModule> logger,
+    Interactor<ShareArkModule> interactor
+) : ChatBehaviour, IConfigurable<ShareArkConfig>
+{
+    public ShareArkConfig Configuration { get; set; } = null!;
+
+    static readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(20) };
+
+    // 由基地址推导三个接口地址，填一个基地址就能用全部功能
+    string Base()
+    {
+        var b = Configuration.BaseUrl;
+        if (string.IsNullOrWhiteSpace(b))
+            throw new Exception("第三方接口基地址没填，去模块配置里补上");
+        return b.Trim().TrimEnd('/');
+    }
+    static readonly Dictionary<string, string[]> _cands = new()
+    {
+        ["ark"] = new[] { "qq-musicArk", "qq_musicark", "musicArk", "music-card" },
+        ["share"] = new[] { "qq-shareArk", "qq_shareArk", "qq-shareark", "shareArk", "share-card" },
+        ["s-163"] = new[] { "163-music-search", "163_music_search", "163-search", "music-search" },
+    };
+    static readonly Dictionary<string, string> _sfx = new();
+    static bool _discovered; // 首页/openapi 路径发现只跑一次
+    string KeyQ() => string.IsNullOrWhiteSpace(Configuration.ApiKey) ? "" : "key=" + Uri.EscapeDataString(Configuration.ApiKey) + "&";
+    // 地址已带 ? 时用 & 接参数，支持手动地址自带 query
+    static string WithQuery(string url, string query) => url.Contains('?') ? url + "&" + query : url + "?" + query;
+    // 报错里附请求URL时把 key 打码
+    static string MaskKey(string url) => Regex.Replace(url, "([?&]key=)[^&]+", "$1***", RegexOptions.IgnoreCase);
+    // 候选可以是后缀也可以是完整地址（自动发现的文档链接可能带全路径）
+    static string JoinUrl(string b, string c) => c.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? c : b + "/" + c;
+    string MusicArkUrl() => !string.IsNullOrWhiteSpace(Configuration.MusicArkUrl) ? Configuration.MusicArkUrl.Trim() : JoinUrl(Base(), _sfx.TryGetValue("ark", out var a) ? a : "qq-musicArk");
+    string ShareArkUrl() => !string.IsNullOrWhiteSpace(Configuration.ShareArkUrl) ? Configuration.ShareArkUrl.Trim() : JoinUrl(Base(), _sfx.TryGetValue("share", out var s) ? s : "qq-shareArk");
+    string SearchUrl(string pf) => !string.IsNullOrWhiteSpace(Configuration.SearchUrl) ? Configuration.SearchUrl.Trim().Replace("{pf}", pf) : JoinUrl(Base(), _sfx.TryGetValue("s-" + pf, out var q) ? q : pf + "-music-search");
+
+    // 填一个基地址就够：默认后缀不通就挨个试候选，试通的记住
+    async Task<string?> Fit(string key, string[] cands, string probe)
+    {
+        string keyQ = KeyQ();
+        foreach (var c in cands)
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                using var r = await http.GetAsync(JoinUrl(Base(), c) + "?" + keyQ + probe, cts.Token);
+                string b = await r.Content.ReadAsStringAsync();
+                using var d = JsonDocument.Parse(b);
+                // 只认 code==200：错误路径回的 {code:404,msg:"API不存在"} 也带 code，一律不认
+                if (d.RootElement.ValueKind == JsonValueKind.Object
+                    && d.RootElement.TryGetProperty("code", out var c0)
+                    && c0.ValueKind == JsonValueKind.Number && c0.GetInt32() == 200)
+                {
+                    _sfx[key] = c;
+                    return c;
+                }
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    // 手动地址覆盖了的不再探测
+    bool Manual(string key) => (key == "ark" && !string.IsNullOrWhiteSpace(Configuration.MusicArkUrl))
+        || (key == "share" && !string.IsNullOrWhiteSpace(Configuration.ShareArkUrl))
+        || (key == "s-163" && !string.IsNullOrWhiteSpace(Configuration.SearchUrl));
+
+    // 每个角色的探测参数：必须是完整合法请求，让正确端点回 code==200（错误包也带 code，不能认）
+    static string ProbeOf(string key) => key == "ark"
+        ? "format=netease&song=t&singer=t&cover=https%3A%2F%2Fexample.com%2Fc.jpg&url=http%3A%2F%2Fmusic.163.com%2Fsong%2Fmedia%2Fouter%2Furl%3Fid%3D1.mp3&jump=http%3A%2F%2Fmusic.163.com%2Fsong%3Fid%3D1"
+        : key == "share" ? "title=t&desc=t&url=https%3A%2F%2Fexample.com&preview=https%3A%2F%2Fexample.com%2Fa.jpg&prompt=t"
+        : "msg=test";
+
+    // 按命名猜路径是哪个角色：share 优先于 search，musicArk 落到 ark
+    static string? RoleOf(string path)
+    {
+        string p = path.ToLowerInvariant();
+        if (p.Contains("share") || p.Contains("link")) return "share";
+        if (p.Contains("search") || p.Contains("sou")) return "search";
+        if (p.Contains("ark") || p.Contains("music") || p.Contains("card") || p.Contains("sign")) return "ark";
+        return null;
+    }
+
+    // 首次用到才适配：先试内置候选，缺的角色再去首页/openapi 挖一圈路径补试
+    async Task EnsureFit()
+    {
+        foreach (var kv in _cands)
+            if (!Manual(kv.Key) && !_sfx.ContainsKey(kv.Key))
+                await Fit(kv.Key, kv.Value, ProbeOf(kv.Key));
+        if (_discovered || string.IsNullOrWhiteSpace(Configuration.BaseUrl)) return;
+        if (!_cands.Any(kv => !Manual(kv.Key) && !_sfx.ContainsKey(kv.Key))) return;
+        _discovered = true;
+        var found = await DiscoverPathsAsync();
+        foreach (var kv in _cands)
+            if (!Manual(kv.Key) && !_sfx.ContainsKey(kv.Key))
+            {
+                string role = kv.Key == "s-163" ? "search" : kv.Key;
+                var extra = found.Where(p => RoleOf(p) == role && !kv.Value.Contains(p)).Take(12).ToArray();
+                if (extra.Length > 0) await Fit(kv.Key, extra, ProbeOf(kv.Key));
+            }
+    }
+
+    // 从基地址首页/域名根文档页与 openapi/swagger 文档里挖接口路径：候选表对不上的第三方也能认出来
+    async Task<List<string>> DiscoverPathsAsync()
+    {
+        var found = new HashSet<string>();
+        string root = Base();
+        string domainRoot = "";
+        try { var u = new Uri(root); domainRoot = u.Scheme + "://" + u.Authority + "/"; }
+        catch { }
+
+        // 归一成候选：完整地址整条收；路径在基地址前缀下取余段，不在就取最后一段
+        void AddCandidate(string c)
+        {
+            if (string.IsNullOrWhiteSpace(c)) return;
+            if (c.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+            {
+                found.Add(c.Split('?')[0].TrimEnd('/'));
+                try { AddCandidate(new Uri(c).AbsolutePath); } catch { }
+                return;
+            }
+            string p = c.Split('?')[0].Trim('/');
+            if (p.Length == 0) return;
+            string basePath = "";
+            try { basePath = new Uri(root).AbsolutePath.TrimEnd('/'); } catch { }
+            if (basePath.Length > 0 && p.StartsWith(basePath + "/", StringComparison.OrdinalIgnoreCase))
+                p = p.Substring(basePath.Length + 1);
+            else if (p.Contains('/'))
+                p = p.Split('/').Last();
+            if (RoleOf(p) != null) found.Add(p);
+        }
+
+        foreach (var docPath in new[] { "openapi.json", "swagger.json", "swagger/v1/swagger.json" })
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                string b = await http.GetStringAsync(root + "/" + docPath, cts.Token);
+                using var d = JsonDocument.Parse(b);
+                if (d.RootElement.ValueKind == JsonValueKind.Object && d.RootElement.TryGetProperty("paths", out var ps))
+                    foreach (var p in ps.EnumerateObject())
+                        if (domainRoot.Length > 0) AddCandidate(domainRoot + p.Name);
+            }
+            catch { }
+        }
+
+        async Task CrawlPage(string pageUrl)
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                string html = await http.GetStringAsync(pageUrl, cts.Token);
+                foreach (Match m in Regex.Matches(html, @"href=[""']([^""']+?)[""']"))
+                {
+                    string h = m.Groups[1].Value;
+                    if (h.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try { var u = new Uri(h); if (u.Host != new Uri(root).Host) continue; AddCandidate(u.Scheme + "://" + u.Authority + u.AbsolutePath); }
+                        catch { continue; }
+                    }
+                    else if (h.StartsWith("/") && domainRoot.Length > 0) AddCandidate(domainRoot + h);
+                    else AddCandidate(h);
+                }
+                foreach (Match m in Regex.Matches(html, @"[A-Za-z][A-Za-z0-9_\-]{2,40}"))
+                    AddCandidate(m.Value);
+            }
+            catch { }
+        }
+        await CrawlPage(root + "/");
+        if (domainRoot.Length > 0 && domainRoot != root.TrimEnd('/') + "/") await CrawlPage(domainRoot);
+        return found.ToList();
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("探测三个接口通不通（音乐卡/分享卡/歌曲搜索），手动地址和自动后缀都会报出来，换了新第三方接口先跑一次这个")]
+    public async Task ProbeBase()
+    {
+        if (Gate(Configuration.EnableProbeBase, "探测接口")) return;
+        try { interactor.Poke(await ProbeBaseReportAsync()); }
+        catch (Exception ex) { interactor.Poke("探测失败：" + ex.Message); }
+    }
+
+    // 探测三个接口，返回报告文本（UI 按钮与 AI 函数共用）
+    public async Task<string> ProbeBaseReportAsync()
+    {
+        var rep = new List<string> { string.IsNullOrWhiteSpace(Configuration.BaseUrl) ? "基地址未填，只用手动地址" : "基地址 " + Base() };
+        async Task Probe(string name, string url)
+        {
+            try
+            {
+                using var r = await http.GetAsync(url);
+                string b = await r.Content.ReadAsStringAsync();
+                bool json = false;
+                try
+                {
+                    using var d = JsonDocument.Parse(b);
+                    json = d.RootElement.ValueKind == JsonValueKind.Object && d.RootElement.TryGetProperty("code", out _);
+                }
+                catch { }
+                rep.Add(name + "：" + (json ? "通" : "不通（返回不是签名接口结构 " + (int)r.StatusCode + "）"));
+            }
+            catch (Exception ex) { rep.Add(name + "：不通（" + ex.Message + "）"); }
+        }
+        string keyQ = KeyQ();
+        await EnsureFit();
+        rep.Add(UrlLine("音乐卡", Configuration.MusicArkUrl, "ark"));
+        rep.Add(UrlLine("分享卡", Configuration.ShareArkUrl, "share"));
+        rep.Add(UrlLine("歌曲搜索", Configuration.SearchUrl, "s-163"));
+        await Probe("歌曲搜索", WithQuery(SearchUrl("163"), keyQ + "msg=" + Uri.EscapeDataString("test")));
+        await Probe("音乐卡", WithQuery(MusicArkUrl(), keyQ + "platform=163&id=1"));
+        await Probe("分享卡", WithQuery(ShareArkUrl(), keyQ + "title=t&desc=t&url=https%3A%2F%2Fexample.com&preview=https%3A%2F%2Fexample.com%2Fa.jpg&prompt=t"));
+        if (!string.IsNullOrWhiteSpace(Configuration.BiliSearchUrl))
+            await Probe("B站搜索", WithQuery(Configuration.BiliSearchUrl.Trim(), keyQ + "msg=" + Uri.EscapeDataString("test")));
+        return string.Join("\n", rep);
+    }
+
+    // 报告每个接口最终用的地址来源：手动填的报地址，自动的报试通的后缀
+    string UrlLine(string name, string manual, string key)
+    {
+        if (!string.IsNullOrWhiteSpace(manual)) return name + "地址 -> 手动 " + manual.Trim();
+        if (_sfx.TryGetValue(key, out var v)) return v.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? name + "地址 -> 自动发现 " + v : name + "后缀 -> " + v;
+        return name + "后缀 -> 未识别，回落默认（可手动填完整地址）";
+    }
+
+    // 猜接口用途，纯展示用
+    static string TagOf(string url)
+    {
+        string l = url.ToLowerInvariant();
+        if (l.Contains("bili")) return "［B站］";
+        if (l.Contains("musicark")) return "［音乐卡］";
+        if (l.Contains("shareark")) return "［分享卡］";
+        if (l.Contains("search")) return "［搜索］";
+        return "";
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("列出第三方基地址下发现的所有接口（来自openapi/swagger文档和站点首页的接口链接，只列举不调用，不消耗接口次数），并标注插件当前在用哪些")]
+    public async Task ProbeAll()
+    {
+        if (Gate(Configuration.EnableProbeAll, "列出全部接口")) return;
+        try { interactor.Poke(await ProbeAllReportAsync()); }
+        catch (Exception ex) { interactor.Poke("列举失败：" + ex.Message); }
+    }
+
+    // 列出基地址下发现的全部接口，返回报告文本（UI 按钮与 AI 函数共用）
+    public async Task<string> ProbeAllReportAsync()
+    {
+        string root = Base();
+            string domainRoot = "";
+            try { var u = new Uri(root); domainRoot = u.Scheme + "://" + u.Authority + "/"; } catch { }
+
+            var paths = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // openapi/swagger 文档：基地址和域名根都试
+            foreach (var b in new[] { root, domainRoot.TrimEnd('/') }.Distinct())
+            {
+                if (b.Length == 0) continue;
+                foreach (var docPath in new[] { "openapi.json", "swagger.json", "swagger/v1/swagger.json" })
+                {
+                    try
+                    {
+                        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                        string body = await http.GetStringAsync(b + "/" + docPath, cts.Token);
+                        using var d = JsonDocument.Parse(body);
+                        if (d.RootElement.ValueKind == JsonValueKind.Object && d.RootElement.TryGetProperty("paths", out var ps))
+                            foreach (var p in ps.EnumerateObject())
+                                paths.Add(b + "/" + p.Name.Trim('/'));
+                    }
+                    catch { }
+                }
+            }
+
+            // 首页链接：同域且路径含 /api/ 或 /series/ 的视为接口线索
+            async Task Crawl(string pageUrl)
+            {
+                try
+                {
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    string html = await http.GetStringAsync(pageUrl, cts.Token);
+                    foreach (Match m in Regex.Matches(html, @"href=[""']([^""']+?)[""']"))
+                    {
+                        string h = m.Groups[1].Value.Split('?')[0];
+                        if (h.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                        {
+                            try { var u = new Uri(h); if (u.Host != new Uri(root).Host) continue; h = u.AbsolutePath; }
+                            catch { continue; }
+                        }
+                        if (h.Length == 0 || !h.StartsWith("/")) continue;
+                        if (h.Contains("/api/") || h.StartsWith("/api/") || h.Contains("/series/") || h.StartsWith("/series/"))
+                            paths.Add(domainRoot.TrimEnd('/') + h);
+                    }
+                }
+                catch { }
+            }
+            await Crawl(root + "/");
+            if (domainRoot.Length > 0 && domainRoot.TrimEnd('/') != root.TrimEnd('/')) await Crawl(domainRoot);
+
+            var rep = new List<string>();
+            if (paths.Count == 0)
+                rep.Add("基地址 " + root + " 下没有发现接口清单（没有openapi文档，首页也没有接口链接），只能靠 ProbeBase 探测已知路径");
+            else
+            {
+                rep.Add("基地址 " + root + "，发现 " + paths.Count + " 个接口：");
+                foreach (var p in paths) rep.Add("  " + TagOf(p) + p);
+            }
+            var used = new List<string>();
+            if (!string.IsNullOrWhiteSpace(Configuration.MusicArkUrl)) used.Add("音乐卡（手动）");
+            else if (_sfx.TryGetValue("ark", out var ua)) used.Add("音乐卡 -> " + ua);
+            if (!string.IsNullOrWhiteSpace(Configuration.ShareArkUrl)) used.Add("分享卡（手动）");
+            else if (_sfx.TryGetValue("share", out var us)) used.Add("分享卡 -> " + us);
+            if (!string.IsNullOrWhiteSpace(Configuration.SearchUrl)) used.Add("歌曲搜索（手动）");
+            else if (_sfx.TryGetValue("s-163", out var uq)) used.Add("歌曲搜索 -> " + uq);
+            if (!string.IsNullOrWhiteSpace(Configuration.BiliSearchUrl)) used.Add("B站搜索（手动）");
+            used.Add("B站系列 -> " + Base() + "/bili-*");
+            rep.Add("插件在用：" + string.Join("；", used));
+            return string.Join("\n", rep);
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("搜索歌曲拿ID，再发卡片。platform取163(网易云)/qq(QQ音乐)/kugou(酷狗)，默认163，不填就搜网易云")]
+    public async Task SearchMusic(
+        [Description("歌名或关键词")] string keyword,
+        [Description("平台：163(网易云)/qq(QQ音乐)/kugou(酷狗)，默认163")] string? platform = null)
+    {
+        if (Gate(Configuration.EnableSearchMusic, "搜歌")) return;
+        try
+        {
+            string pf = (platform ?? "163").Trim().ToLowerInvariant();
+            if (pf == "netease") pf = "163";
+            if (pf != "163" && pf != "qq" && pf != "kugou")
+                throw new Exception("搜索只支持 163/qq/kugou");
+            await EnsureFit();
+            string keyQ = KeyQ();
+            string u = WithQuery(SearchUrl(pf), keyQ + "msg=" + Uri.EscapeDataString(keyword));
+            string body = await http.GetStringAsync(u);
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.GetProperty("code").GetInt32() != 200)
+                throw new Exception(doc.RootElement.TryGetProperty("msg", out var mm) ? mm.GetString() : "搜索失败");
+            var arr = doc.RootElement.GetProperty("data");
+            List<string> lines = new();
+            int n = 0;
+            foreach (var s0 in arr.EnumerateArray())
+            {
+                if (n >= 5) break;
+                string t = s0.TryGetProperty("title", out var tv) ? tv.GetString() ?? "" : "";
+                string a = s0.TryGetProperty("author", out var av) ? av.GetString() ?? "" : "";
+                string q = s0.TryGetProperty("quality", out var qv) ? qv.GetString() ?? "" : "";
+                string idv = s0.TryGetProperty("id", out var iv) ? iv.GetString() ?? "" : "";
+                if (q.Length > 0) lines.Add(idv + " | " + t + " - " + a + " [" + q + "]");
+                else lines.Add(idv + " | " + t + " - " + a);
+                n++;
+            }
+            if (lines.Count == 0) lines.Add("没搜到");
+            interactor.Poke(string.Join("\n", lines));
+        }
+        catch (Exception ex) { interactor.Poke("搜索失败：" + ex.Message); }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("搜索B站视频拿BV号，用于再发卡片。配置了B站搜索接口地址就走第三方，否则走B站官方")]
+    public async Task SearchBili([Description("视频关键词")] string keyword)
+    {
+        if (Gate(Configuration.EnableSearchBili, "B站搜索")) return;
+        try
+        {
+            var hits = (await BiliSearchAsync(keyword)).Take(5);
+            var lines = hits.Select(h => h.bv + " - " + h.title).ToList();
+            if (lines.Count == 0) lines.Add("没搜到");
+            interactor.Poke(string.Join("\n", lines));
+        }
+        catch (Exception ex) { interactor.Poke("搜索失败：" + ex.Message); }
+    }
+
+    // B站视频搜索统一入口：配置了第三方接口走 {code,data:[{id,title}]}，否则走B站官方，都归一成 (BV号, 标题) 列表
+    async Task<List<(string bv, string title)>> BiliSearchAsync(string keyword)
+    {
+        var list = new List<(string, string)>();
+        if (!string.IsNullOrWhiteSpace(Configuration.BiliSearchUrl))
+        {
+            string u = WithQuery(Configuration.BiliSearchUrl.Trim(), KeyQ() + "msg=" + Uri.EscapeDataString(keyword));
+            string body = await http.GetStringAsync(u);
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.GetProperty("code").GetInt32() != 200)
+                throw new Exception(doc.RootElement.TryGetProperty("msg", out var mm) ? mm.GetString() ?? "" : "搜索失败");
+            foreach (var v in doc.RootElement.GetProperty("data").EnumerateArray())
+            {
+                string bv = v.TryGetProperty("id", out var iv) ? iv.GetString() ?? "" : "";
+                string t = v.TryGetProperty("title", out var tv) ? Regex.Replace(tv.GetString() ?? "", "<[^>]*>", "") : "";
+                if (bv.Length > 0) list.Add((bv, t));
+            }
+            return list;
+        }
+        string ou = "https://api.bilibili.com/x/web-interface/search/all/v2?keyword=" + Uri.EscapeDataString(keyword);
+        using var req = new HttpRequestMessage(HttpMethod.Get, ou);
+        req.Headers.Referrer = new Uri("https://www.bilibili.com/");
+        req.Headers.TryAddWithoutValidation("Cookie", "buvid3=1; b_nut=1");
+        req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+        string obody = await (await http.SendAsync(req)).Content.ReadAsStringAsync();
+        using var odoc = JsonDocument.Parse(obody);
+        foreach (var sec in odoc.RootElement.GetProperty("data").GetProperty("result").EnumerateArray())
+        {
+            if (sec.GetProperty("result_type").GetString() != "video") continue;
+            foreach (var v in sec.GetProperty("data").EnumerateArray())
+                list.Add((v.GetProperty("bvid").GetString() ?? "", Regex.Replace(v.GetProperty("title").GetString() ?? "", "<[^>]*>", "")));
+        }
+        return list;
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("发送音乐/视频卡片到QQ（自签名版，不依赖协议端签名，比QQ增强的点歌更通用）。platform取163(网易云)/qq(QQ音乐)/bilibili(BV号)/kugou；id为歌曲ID或BV号；type不填默认group")]
+    public async Task SendArkCard(
+        [Description("平台：163/qq/bilibili/kugou")] string platform,
+        [Description("歌曲ID或BV号")] string id,
+        [Description("目标群号或QQ号")] long? targetId = null,
+        [Description("group或private，默认group")] string? type = null,
+        [Description("卡片标题，可留空")] string? title = null)
+    {
+        if (Gate(Configuration.EnableSendArkCard, "发音乐/视频卡片")) return;
+        if (targetId == null)
+            throw new Exception("没给目标，发群里还是私聊得说一个");
+        long target = targetId.Value;
+        bool isGroup = !string.Equals(type, "private", StringComparison.OrdinalIgnoreCase);
+        try
+        {
+            await EnsureFit();
+            string card = await SignAsync(platform, id, title);
+            bool ok = await SendJsonAsync(target, isGroup, card);
+            if (ok) interactor.Poke("卡片已发出"); else interactor.Poke("卡片没发出去");
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning("发卡片失败：" + ex.Message);
+            interactor.Poke("发卡片失败：" + ex.Message);
+        }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("把任意网页链接拼成QQ分享卡发出（通用链接卡，走分享卡签名接口）。title标题，desc描述，url跳转链接，preview预览图可留空，prompt提示文本可留空，type不填默认group")]
+    public async Task SendShareCard(
+        [Description("跳转链接")] string url,
+        [Description("卡片标题，可留空，留空自动抓")] string? title = null,
+        [Description("卡片描述，可留空，留空自动抓")] string? desc = null,
+        [Description("预览图URL，可留空")] string? preview = null,
+        [Description("提示文本，可留空")] string? prompt = null,
+        [Description("目标群号或QQ号")] long? targetId = null,
+        [Description("group或private，默认group")] string? type = null)
+    {
+        if (Gate(Configuration.EnableSendShareCard, "发通用分享卡")) return;
+        if (targetId == null)
+            throw new Exception("没给目标，发群里还是私聊得说一个");
+        long target = targetId.Value;
+        bool isGroup = !string.Equals(type, "private", StringComparison.OrdinalIgnoreCase);
+        try
+        {
+            // 过滤B站链接：B站走专用搜索+音乐卡接口，不走通用分享卡
+            await EnsureFit();
+            string host = "";
+            try { host = new Uri(url).Host.ToLowerInvariant(); } catch { }
+                if ((host.Contains("bilibili.com") || host.Contains("b23.tv") || host.Contains("biligame.com")) && !host.StartsWith("live."))
+                    throw new Exception("B站视频/主页链接不走自定义卡，用 SearchBili 拿BV号再 SendArkCard，或用 BiliParse 解析这个链接，直播可直接发");
+
+            var meta = await FetchMetaAsync(url);
+            if (preview != null && preview.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) preview = null; // data URI 不收，回落自动抓
+            if (string.IsNullOrWhiteSpace(title)) title = meta.title;
+            if (string.IsNullOrWhiteSpace(desc)) desc = meta.desc;
+            if (string.IsNullOrWhiteSpace(preview)) preview = meta.image;
+            if (string.IsNullOrWhiteSpace(title)) title = url;
+            if (string.IsNullOrWhiteSpace(desc)) desc = title;
+            if (string.IsNullOrWhiteSpace(prompt))
+                prompt = "[分享]" + title;
+            string shareUrl = ShareArkUrl();
+            var q = new Dictionary<string, string>
+            {
+                ["title"] = title,
+                ["desc"] = desc,
+                ["preview"] = preview,
+                ["url"] = url,
+                ["prompt"] = prompt
+            };
+            if (!string.IsNullOrWhiteSpace(Configuration.ApiKey)) q["key"] = Configuration.ApiKey;
+            string query = string.Join("&", q.Select(kv => Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value ?? "")));
+            string full = WithQuery(shareUrl, query);
+            string body = await http.GetStringAsync(full);
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.GetProperty("code").GetInt32() != 200)
+                throw new Exception("签名失败：" + doc.RootElement.GetProperty("msg").GetString() + " | 请求=" + MaskKey(full));
+            string card = doc.RootElement.GetProperty("data").GetRawText();
+            bool ok = await SendJsonAsync(target, isGroup, card);
+            if (ok) interactor.Poke("分享卡已发出"); else interactor.Poke("分享卡没发出去");
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning("发分享卡失败：" + ex.Message);
+            interactor.Poke("发分享卡失败：" + ex.Message);
+        }
+    }
+
+    // ---------- B站系列（{BaseUrl}/bili-*，均需 ApiKey，文档见咸鱼API /series/bili） ----------
+
+    // 第三方接口统一调用（B站系列/IP查询等，均在 {BaseUrl} 下）：拼 key 参数，code!=200 时抛出 msg
+    async Task<JsonElement> ApiCall(string path, params (string k, string? v)[] ps)
+    {
+        if (string.IsNullOrWhiteSpace(Configuration.ApiKey))
+            throw new Exception("B站系列接口需要 ApiKey，去模块配置里补上");
+        var q = new List<string> { "key=" + Uri.EscapeDataString(Configuration.ApiKey) };
+        foreach (var (k, v) in ps)
+            if (!string.IsNullOrWhiteSpace(v)) q.Add(Uri.EscapeDataString(k) + "=" + Uri.EscapeDataString(v));
+        string body = await http.GetStringAsync(WithQuery(Base() + "/" + path, string.Join("&", q)));
+        using var doc = JsonDocument.Parse(body);
+        if (doc.RootElement.GetProperty("code").GetInt32() != 200)
+            throw new Exception(doc.RootElement.TryGetProperty("msg", out var m) ? m.GetString() ?? "" : "调用失败");
+        return doc.RootElement.GetProperty("data").Clone();
+    }
+
+    // 字段取值兼容字符串和数字
+    static string S(JsonElement e, string k) => e.TryGetProperty(k, out var v)
+        ? (v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : v.ValueKind == JsonValueKind.Number ? v.GetRawText() : "")
+        : "";
+
+    // 功能开关检查：关闭时向AI说明并返回 true（调用方据此直接返回）
+    bool Gate(bool enabled, string name)
+    {
+        if (enabled) return false;
+        interactor.Poke(name + "功能已在插件配置中关闭");
+        return true;
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("解析B站链接（视频/b23.tv短链/专栏/番剧/直播间），返回类型、ID、标题、UP主等详情；action=play 时额外返回视频播放直链")]
+    public async Task BiliParse(
+        [Description("B站链接")] string url,
+        [Description("id=仅类型和ID；detail=详情（默认）；play=额外返回播放直链")] string? action = null,
+        [Description("清晰度80/64/32/16，仅action=play生效，默认80")] int? qn = null)
+    {
+        if (Gate(Configuration.EnableBiliParse, "B站链接解析")) return;
+        try
+        {
+            var d = await ApiCall("bili-url-parse", ("url", url), ("action", action), ("qn", qn?.ToString()));
+            var rep = new List<string> { "类型 " + S(d, "type") + "，ID " + S(d, "id") };
+            string title = S(d, "title");
+            if (title.Length > 0) rep.Add(title);
+            if (d.TryGetProperty("owner", out var ow) && ow.ValueKind == JsonValueKind.Object)
+                rep.Add("UP主 " + S(ow, "name"));
+            if (d.TryGetProperty("author", out var au) && au.ValueKind == JsonValueKind.Object)
+                rep.Add("作者 " + S(au, "name"));
+            if (d.TryGetProperty("stat", out var st) && st.ValueKind == JsonValueKind.Object)
+                rep.Add("播放 " + S(st, "view") + "，点赞 " + S(st, "like") + "，评论 " + S(st, "reply"));
+            if (S(d, "duration_text").Length > 0) rep.Add("时长 " + S(d, "duration_text"));
+            if (d.TryGetProperty("rating", out var rt) && rt.ValueKind == JsonValueKind.Number) rep.Add("评分 " + rt.GetDouble());
+            if (d.TryGetProperty("ep_count", out var ec) && ec.ValueKind == JsonValueKind.Number) rep.Add("共 " + ec.GetInt32() + " 集");
+            if (action == "play")
+            {
+                if (d.TryGetProperty("play", out var play))
+                {
+                    if (play.TryGetProperty("quality_desc", out var qd)) rep.Add("清晰度 " + qd.GetString());
+                    string? direct = null;
+                    if (play.TryGetProperty("no_referer_url", out var nru) && nru.ValueKind == JsonValueKind.String) direct = nru.GetString();
+                    else if (play.TryGetProperty("durl", out var dl) && dl.ValueKind == JsonValueKind.Array && dl.GetArrayLength() > 0) direct = dl[0].GetString();
+                    else if (play.TryGetProperty("dash", out var dash) && dash.TryGetProperty("video", out var vd) && vd.ValueKind == JsonValueKind.Array && vd.GetArrayLength() > 0)
+                        direct = vd[0].TryGetProperty("base_url", out var bu) ? bu.GetString() : null;
+                    if (!string.IsNullOrEmpty(direct)) rep.Add("直链 " + direct);
+                }
+            }
+            rep.Add("链接 " + S(d, "web_url"));
+            interactor.Poke(string.Join("\n", rep));
+        }
+        catch (Exception ex) { interactor.Poke("解析失败：" + ex.Message); }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("通过UID查询B站用户信息：昵称、等级、粉丝数、签名、认证、投稿数等")]
+    public async Task BiliUserInfo([Description("用户mid")] long uid)
+    {
+        if (Gate(Configuration.EnableBiliUserInfo, "B站用户查询")) return;
+        try
+        {
+            var d = await ApiCall("bili-user-info", ("uid", uid.ToString()));
+            var rep = new List<string> { S(d, "name") + "（" + S(d, "mid") + "）" };
+            string vip = S(d, "vip_label");
+            rep.Add("等级 " + S(d, "level") + (vip.Length > 0 ? "，" + vip : ""));
+            rep.Add("粉丝 " + S(d, "fans") + "，关注 " + S(d, "following") + "，获赞 " + S(d, "likes"));
+            rep.Add("投稿视频 " + S(d, "archive_count") + "，专栏 " + S(d, "article_count"));
+            string sign = S(d, "sign");
+            if (sign.Length > 0) rep.Add("签名：" + sign);
+            if (d.TryGetProperty("official", out var of) && of.ValueKind == JsonValueKind.Object && S(of, "title").Length > 0)
+                rep.Add("认证：" + S(of, "title"));
+            interactor.Poke(string.Join("\n", rep));
+        }
+        catch (Exception ex) { interactor.Poke("查询失败：" + ex.Message); }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("查询B站UP主最新动态/视频/专栏更新，可翻页；视频更新带BV号，可直接拿去发卡片")]
+    public async Task BiliUpdates(
+        [Description("UP主mid")] long uid,
+        [Description("类型过滤：all=全部（默认）/video=仅视频/article=仅专栏")] string? type = null,
+        [Description("翻页游标，填上一次结果里的 next_offset")] string? offset = null)
+    {
+        if (Gate(Configuration.EnableBiliUpdates, "UP主更新查询")) return;
+        try
+        {
+            var d = await ApiCall("bili-user-update", ("uid", uid.ToString()), ("type", type ?? "all"), ("offset", offset));
+            var rep = new List<string>();
+            foreach (var it in d.GetProperty("items").EnumerateArray())
+            {
+                string line = S(it, "pub_time_text") + " " + (S(it, "title").Length > 0 ? S(it, "title") : S(it, "summary"));
+                if (S(it, "bvid").Length > 0) line += "（" + S(it, "bvid") + "）";
+                rep.Add(line);
+            }
+            if (rep.Count == 0) rep.Add("没有更新");
+            if (d.TryGetProperty("has_more", out var hm) && hm.ValueKind == JsonValueKind.True && S(d, "next_offset").Length > 0)
+                rep.Add("还有更多，用 offset=" + S(d, "next_offset") + " 翻页");
+            interactor.Poke(string.Join("\n", rep));
+        }
+        catch (Exception ex) { interactor.Poke("查询失败：" + ex.Message); }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("获取B站热门视频榜，或某个视频的相关推荐（related 需传bvid）")]
+    public async Task BiliHot(
+        [Description("popular=热门榜（默认）/related=相关推荐")] string? action = null,
+        [Description("相关推荐时的视频BV号")] string? bvid = null,
+        [Description("热门榜页码，默认1，每页100")] int? pn = null)
+    {
+        if (Gate(Configuration.EnableBiliHot, "B站热门/相关")) return;
+        try
+        {
+            string a = (action ?? "popular").Trim().ToLowerInvariant();
+            var d = await ApiCall("bili-hot-recommend", ("action", a), ("bvid", bvid), ("pn", pn?.ToString()));
+            var rep = new List<string>();
+            int n = 0;
+            foreach (var it in d.GetProperty("items").EnumerateArray())
+            {
+                if (n >= 10) break;
+                string line = (it.TryGetProperty("ranking", out var rk) ? rk.GetInt32() + ". " : "") + S(it, "bvid") + " - " + S(it, "title");
+                if (it.TryGetProperty("owner", out var ow2) && ow2.ValueKind == JsonValueKind.Object) line += " - " + S(ow2, "name");
+                if (S(it, "view_text").Length > 0) line += " [" + S(it, "view_text") + "播放]";
+                rep.Add(line);
+                n++;
+            }
+            if (rep.Count == 0) rep.Add("没有内容");
+            interactor.Poke(string.Join("\n", rep));
+        }
+        catch (Exception ex) { interactor.Poke("查询失败：" + ex.Message); }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("B站扫码登录：action=generate 申请二维码（把返回的二维码链接发出来让人扫），action=poll 用 qrcode_key 查登录状态；登录成功返回 cookie_id")]
+    public async Task BiliQrLogin(
+        [Description("generate=申请二维码 / poll=轮询登录状态")] string action,
+        [Description("action=poll时填 generate 返回的 qrcode_key")] string? qrcodeKey = null)
+    {
+        if (Gate(Configuration.EnableBiliQrLogin, "B站扫码登录")) return;
+        try
+        {
+            var d = await ApiCall("bili-qrcode-login", ("action", action), ("qrcode_key", qrcodeKey));
+            if (action == "generate")
+                interactor.Poke("qrcode_key " + S(d, "qrcode_key") + "\n二维码链接（180秒内有效，打开后扫码）：\n" + S(d, "qrcode_url") + "\n扫完后用 action=poll、qrcode_key 查结果");
+            else
+            {
+                string status = S(d, "status");
+                string msg = S(d, "message").Length > 0 ? S(d, "message") : status;
+                if (status == "success")
+                    msg += "\ncookie_id " + S(d, "cookie_id") + "，用户 " + S(d, "uname") + "，有效期至 " + S(d, "expire_at");
+                interactor.Poke(msg);
+            }
+        }
+        catch (Exception ex) { interactor.Poke("登录流程失败：" + ex.Message); }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("刷新或检查服务器保存的B站登录Cookie，延长有效期；action=check 仅检查是否需要刷新，refresh=执行刷新（默认）")]
+    public async Task BiliCookieRefresh(
+        [Description("Cookie唯一标识ID")] string cookieId,
+        [Description("check=仅检查 / refresh=执行刷新（默认）")] string? action = null)
+    {
+        if (Gate(Configuration.EnableBiliCookieRefresh, "Cookie刷新")) return;
+        try
+        {
+            var d = await ApiCall("bili-cookie-refresh", ("cookie_id", cookieId), ("action", action));
+            bool refreshed = d.TryGetProperty("refreshed", out var rf) && rf.ValueKind == JsonValueKind.True;
+            string extra = refreshed ? "已刷新，新有效期至 " + S(d, "new_expire_at")
+                : S(d, "message").Length > 0 ? S(d, "message") : "未刷新";
+            interactor.Poke("Cookie " + S(d, "cookie_id") + " " + extra);
+        }
+        catch (Exception ex) { interactor.Poke("刷新失败：" + ex.Message); }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("管理服务器保存的B站登录Cookie：list=列出全部（默认，不含敏感字段）/check=验证登录态/delete=删除/save=导入Cookie字符串。故意不提供导出完整Cookie的动作，避免凭据进入聊天记录")]
+    public async Task BiliCookie(
+        [Description("list=列出/check=验证/delete=删除/save=导入")] string? action = null,
+        [Description("Cookie唯一标识ID，check/delete时填")] string? cookieId = null,
+        [Description("action=save时必填，格式 k1=v1; k2=v2")] string? cookieString = null)
+    {
+        if (Gate(Configuration.EnableBiliCookie, "Cookie管理")) return;
+        try
+        {
+            string a = (action ?? "list").Trim().ToLowerInvariant();
+            var d = await ApiCall("bili-user-cookie", ("action", a), ("cookie_id", cookieId), ("cookie_string", cookieString));
+            switch (a)
+            {
+                case "list":
+                    var rep = new List<string>();
+                    foreach (var it in d.GetProperty("items").EnumerateArray())
+                        rep.Add(S(it, "cookie_id") + " " + S(it, "uname") + "（" + S(it, "uid") + "）有效期至 " + S(it, "expire_at") + "，已用 " + S(it, "use_count") + " 次");
+                    if (rep.Count == 0) rep.Add("没有保存的Cookie");
+                    interactor.Poke(string.Join("\n", rep));
+                    break;
+                case "check":
+                    bool valid = d.TryGetProperty("valid", out var vv) && vv.ValueKind == JsonValueKind.True;
+                    interactor.Poke("Cookie " + S(d, "cookie_id") + " " + (valid ? "登录态有效：" + S(d, "uname") + "（" + S(d, "uid") + "）" : "无效：" + S(d, "message")));
+                    break;
+                case "delete":
+                    interactor.Poke("Cookie " + S(d, "cookie_id") + (d.TryGetProperty("deleted", out var del) && del.ValueKind == JsonValueKind.True ? " 已删除" : " 删除失败"));
+                    break;
+                case "save":
+                    interactor.Poke("已导入，cookie_id " + S(d, "cookie_id") + "，用户 " + S(d, "uname") + "，有效期至 " + S(d, "expire_at"));
+                    break;
+                default:
+                    interactor.Poke("不支持的action：" + a + "（可用 list/check/delete/save）");
+                    break;
+            }
+        }
+        catch (Exception ex) { interactor.Poke("操作失败：" + ex.Message); }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("查询IP地址的地理位置、运营商、ASN、时区；不填ip则查询本机出口IP")]
+    public async Task IpLookup([Description("要查询的IP地址，留空查本机出口IP")] string? ip = null)
+    {
+        if (Gate(Configuration.EnableIpLookup, "IP查询")) return;
+        try
+        {
+            var d = await ApiCall("ip-lookup", ("ip", ip));
+            bool self = d.TryGetProperty("is_self", out var sf) && sf.ValueKind == JsonValueKind.True;
+            var rep = new List<string>
+            {
+                S(d, "ip") + (self ? "（本机出口）" : ""),
+                S(d, "country") + " " + S(d, "region") + " " + S(d, "city"),
+                "运营商 " + S(d, "isp") + "，组织 " + S(d, "org") + "，ASN " + S(d, "asn"),
+                "时区 " + S(d, "timezone") + "，坐标 " + S(d, "latitude") + "," + S(d, "longitude")
+            };
+            interactor.Poke(string.Join("\n", rep));
+        }
+        catch (Exception ex) { interactor.Poke("查询失败：" + ex.Message); }
+    }
+
+    class PageMeta { public string title = ""; public string desc = ""; public string image = ""; }
+
+    async Task<PageMeta> FetchMetaAsync(string url)
+    {
+        var m = new PageMeta();
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+            // 页面抓取只给8秒：国外站连不上时别拖满20秒全局超时
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            string html = await (await http.SendAsync(req, cts.Token)).Content.ReadAsStringAsync(cts.Token);
+            m.title = Meta(html, "og:title") ?? Meta(html, "twitter:title") ?? "";
+            m.desc = Meta(html, "og:description") ?? Meta(html, "description") ?? "";
+            m.image = Meta(html, "og:image") ?? Meta(html, "twitter:image") ?? "";
+            if (string.IsNullOrWhiteSpace(m.image))
+            {
+                Match lm = Regex.Match(html, "<link[^>]+rel=[\"'][^\"']*icon[^\"']*[\"'][^>]*?href=[\"']([^\"']+)[\"']", RegexOptions.IgnoreCase);
+                if (!lm.Success) lm = Regex.Match(html, "<link[^>]+href=[\"']([^\"']+)[\"'][^>]*?rel=[\"'][^\"']*icon[^\"']*[\"']", RegexOptions.IgnoreCase);
+                if (lm.Success)
+                {
+                    try { m.image = new Uri(new Uri(url), lm.Groups[1].Value).ToString(); } catch { }
+                }
+            }
+            if (string.IsNullOrWhiteSpace(m.title))
+                m.title = Regex.Match(html, @"<title[^>]*>(.*?)</title>", RegexOptions.Singleline | RegexOptions.IgnoreCase).Groups[1].Value.Trim();
+        }
+        catch (Exception ex) { logger.LogWarning("抓网页meta失败：" + ex.Message); }
+        // 页面抓不到（超时/被墙）也必须给非空预览：签名端空值当缺参，直接用站点favicon
+        if (string.IsNullOrWhiteSpace(m.image))
+        {
+            try { m.image = new Uri(new Uri(url), "/favicon.ico").ToString(); } catch { }
+        }
+        return m;
+    }
+
+    static string Meta(string html, string prop)
+    {
+        var p = Regex.Escape(prop);
+        var a = Regex.Match(html, @"<meta[^>]+(?:property|name)=[""']" + p + @"[""'][^>]+content=[""']([^""']*)", RegexOptions.IgnoreCase);
+        if (a.Success) return a.Groups[1].Value;
+        var b = Regex.Match(html, @"<meta[^>]+content=[""']([^""']*)[""'][^>]+(?:property|name)=[""']" + p + @"[""']", RegexOptions.IgnoreCase);
+        return b.Success ? b.Groups[1].Value : "";
+    }
+
+    // 传歌名不是ID时统一走搜索接口拿第一条，不再各平台手写一遍自带API
+    async Task<(string id, string title, string author, string cover)> SearchFirstAsync(string pf, string kw)
+    {
+        string keyQ = KeyQ();
+        string u = WithQuery(SearchUrl(pf), keyQ + "msg=" + Uri.EscapeDataString(kw));
+        string body = await http.GetStringAsync(u);
+        using var doc = JsonDocument.Parse(body);
+        if (doc.RootElement.GetProperty("code").GetInt32() != 200)
+            throw new Exception("搜索失败");
+        var d = doc.RootElement.GetProperty("data")[0];
+        string G(string k) => d.TryGetProperty(k, out var v) ? (v.GetString() ?? "") : "";
+        return (G("id"), G("title"), G("author"), G("cover"));
+    }
+
+    async Task<Dictionary<string, string>> ResolveInfoAsync(string platform, string id, string? title)
+    {
+        var info = new Dictionary<string, string>();
+        platform = (platform ?? "163").Trim().ToLowerInvariant();
+        if (platform == "163")
+        {
+            try
+            {
+                if (!id.All(char.IsDigit))
+                {
+                    var r = await SearchFirstAsync("163", id);
+                    id = r.id;
+                    if (string.IsNullOrWhiteSpace(title)) title = r.title;
+                }
+                using var req = new HttpRequestMessage(HttpMethod.Get, "https://music.163.com/api/song/detail/?ids=[" + id + "]");
+                req.Headers.Referrer = new Uri("https://music.163.com/");
+                req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+                string body = await (await http.SendAsync(req)).Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(body);
+                var s = doc.RootElement.GetProperty("songs")[0];
+                info["song"] = s.GetProperty("name").GetString() ?? "未知歌曲";
+                info["singer"] = string.Join("/", s.GetProperty("artists").EnumerateArray().Select(a => a.GetProperty("name").GetString()));
+                info["cover"] = s.TryGetProperty("album", out var alb) && alb.TryGetProperty("picUrl", out var pu) ? pu.GetString() ?? "" : "";
+            }
+            catch { info["song"] = "未知歌曲"; info["singer"] = "未知"; info["cover"] = ""; }
+            info["format"] = "netease";
+            info["url"] = "http://music.163.com/song/media/outer/url?id=" + id + ".mp3";
+            info["jump"] = "http://music.163.com/song?id=" + id;
+        }
+        else if (platform == "bilibili")
+        {
+            try
+            {
+                if (!id.StartsWith("BV", StringComparison.OrdinalIgnoreCase))
+                {
+                    var hits = await BiliSearchAsync(id);
+                    string? pick = null;
+                    var words = id.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var (bv, vt) in hits)
+                    {
+                        if (words.Length > 0 && words.All(w => vt.Contains(w))) { pick = bv; break; }
+                    }
+                    if (pick == null && hits.Count > 0) pick = hits[0].bv;
+                    if (pick == null) throw new Exception("没搜到匹配的视频");
+                    id = pick;
+                }
+                using var req = new HttpRequestMessage(HttpMethod.Get, "https://api.bilibili.com/x/web-interface/view?bvid=" + id);
+                req.Headers.Referrer = new Uri("https://www.bilibili.com/video/" + id);
+                req.Headers.TryAddWithoutValidation("Accept", "application/json, text/plain, */*");
+                req.Headers.TryAddWithoutValidation("Cookie", "buvid3=1; b_nut=1");
+                req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+                string body = await (await http.SendAsync(req)).Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(body);
+                var dd = doc.RootElement.GetProperty("data");
+                string pic = dd.GetProperty("pic").GetString() ?? "";
+                if (pic.StartsWith("//")) pic = "https:" + pic;
+                info["song"] = dd.GetProperty("title").GetString() ?? "未知视频";
+                info["singer"] = dd.GetProperty("owner").GetProperty("name").GetString() ?? "bilibili";
+                info["cover"] = pic;
+            }
+            catch { info["song"] = "未知视频"; info["singer"] = "bilibili"; info["cover"] = ""; }
+            info["url"] = "https://www.bilibili.com/video/" + id;
+            info["jump"] = "https://www.bilibili.com/video/" + id;
+            info["format"] = "bilibili";
+        }
+        else if (platform == "qq")
+        {
+            try
+            {
+                if (id.Length != 14)
+                {
+                    var r = await SearchFirstAsync("qq", id);
+                    if (!string.IsNullOrWhiteSpace(r.id)) id = r.id;
+                    if (string.IsNullOrWhiteSpace(title)) title = r.title;
+                }
+                string u = "https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg?songmid=" + id + "&platform=yqq&format=json&inCharset=utf8&outCharset=utf-8";
+                using var req = new HttpRequestMessage(HttpMethod.Get, u);
+                req.Headers.Referrer = new Uri("https://y.qq.com/");
+                req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+                string body = await (await http.SendAsync(req)).Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(body);
+                var dd = doc.RootElement.GetProperty("data")[0];
+                string albid = dd.GetProperty("album").GetProperty("mid").GetString() ?? "";
+                info["song"] = dd.GetProperty("title").GetString() ?? "未知歌曲";
+                info["singer"] = string.Join("/", dd.GetProperty("singer").EnumerateArray().Select(a => a.GetProperty("name").GetString()));
+                info["cover"] = "https://y.qq.com/music/photo_new/T002R300x300M000" + albid + ".jpg";
+            }
+            catch { info["song"] = "未知歌曲"; info["singer"] = "未知"; info["cover"] = ""; }
+            info["url"] = "https://y.qq.com/n/ryqq/songDetail/" + id;
+            info["jump"] = "https://y.qq.com/n/ryqq/songDetail/" + id;
+            info["format"] = "qq";
+        }
+        else if (platform == "kugou")
+        {
+            // 酷狗：列表模式搜索没有 cover，且签名端要求 url 为播放地址；
+            // 统一先拿到 hash（传歌名先搜），再用 hash 走详情接口（id 参数）拿直链/封面/播放页
+            if (Regex.IsMatch(id, "^[0-9A-Fa-f]{32}$") == false)
+            {
+                var r = await SearchFirstAsync("kugou", id);
+                if (!string.IsNullOrWhiteSpace(r.id)) id = r.id;
+            }
+            string songName = "酷狗音乐", singerName = "酷狗音乐", kugouCover = "", playUrl = "";
+            string pageUrl = "https://www.kugou.com/song/#hash=" + id;
+            try
+            {
+                string du = WithQuery(SearchUrl("kugou"), KeyQ() + "id=" + Uri.EscapeDataString(id));
+                string dbody = await http.GetStringAsync(du);
+                using var ddoc = JsonDocument.Parse(dbody);
+                if (ddoc.RootElement.GetProperty("code").GetInt32() == 200)
+                {
+                    var dd = ddoc.RootElement.GetProperty("data");
+                    string D(string k) => dd.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+                    if (D("title").Length > 0) songName = D("title");
+                    if (D("author").Length > 0) singerName = D("author");
+                    if (D("cover").Length > 0) kugouCover = D("cover").Replace("{size}", "480");
+                    if (D("url").Length > 0) playUrl = D("url");
+                    if (D("link").Length > 0) pageUrl = D("link");
+                }
+            }
+            catch { }
+            if (!string.IsNullOrWhiteSpace(title)) songName = title;
+            info["song"] = songName;
+            info["singer"] = singerName;
+            info["cover"] = kugouCover;
+            info["url"] = playUrl.Length > 0 ? playUrl : pageUrl;
+            info["jump"] = pageUrl;
+            info["format"] = "kugou";
+        }
+        else throw new Exception("不支持的平台：" + platform);
+
+        if (!string.IsNullOrEmpty(title) && platform != "kugou" && platform != "qq" && platform != "bilibili") info["song"] = title;
+        return info;
+    }
+
+    async Task<string> SignAsync(string platform, string id, string? title)
+    {
+        var info = await ResolveInfoAsync(platform, id, title);
+        // 签名端所有参数必填且空值当缺失：封面为空时回落抓播放页的 og:image
+        if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("cover")))
+        {
+            var meta = await FetchMetaAsync(info.GetValueOrDefault("jump") ?? "");
+            if (!string.IsNullOrWhiteSpace(meta.image)) info["cover"] = meta.image;
+        }
+        if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("song"))) info["song"] = "未知";
+        if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("singer"))) info["singer"] = "未知";
+        if (!string.IsNullOrWhiteSpace(Configuration.ApiKey)) info["key"] = Configuration.ApiKey;
+
+        for (int attempt = 0; ; attempt++)
+        {
+            string query = string.Join("&", info.Select(kv => Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value ?? "")));
+            string fullUrl = WithQuery(MusicArkUrl(), query);
+            string body = await http.GetStringAsync(fullUrl);
+            using var doc = JsonDocument.Parse(body);
+            int code = doc.RootElement.GetProperty("code").GetInt32();
+            if (code == 200)
+            {
+                JsonNode? node = JsonNode.Parse(doc.RootElement.GetProperty("data").GetRawText());
+                string songName = info["song"];
+                try { songName = node!["meta"]!["music"]!["title"]!.GetValue<string>(); } catch { }
+                node!["prompt"] = "[分享]" + songName;
+                node!["ver"] = "0.0.0.1";
+                node!["view"] = "music";
+                return node.ToJsonString();
+            }
+            string msg = doc.RootElement.TryGetProperty("msg", out var mm) ? mm.GetString() ?? "" : "";
+            // 缓存的接口后缀失效（服务端报 API 不存在）：清掉重探，再试一次
+            if (attempt == 0 && msg.Contains("不存在"))
+            {
+                _sfx.Clear();
+                await EnsureFit();
+                continue;
+            }
+            throw new Exception("签名失败：" + msg + " | 请求=" + MaskKey(fullUrl));
+        }
+    }
+
+    private static ClientWebSocket? _sharedWs;
+    private static readonly SemaphoreSlim _wsLock = new(1, 1);
+
+    async Task<bool> SendJsonAsync(long target, bool isGroup, string cardJson)
+    {
+        await _wsLock.WaitAsync();
+        try
+        {
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                try
+                {
+                    if (_sharedWs == null || _sharedWs.State != WebSocketState.Open)
+                    {
+                        _sharedWs?.Dispose();
+                        _sharedWs = new ClientWebSocket();
+                        using var cts0 = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                        await _sharedWs.ConnectAsync(new Uri(Configuration.WsUrl), cts0.Token);
+                    }
+
+                    string echo = Guid.NewGuid().ToString();
+                    string action = isGroup ? "send_group_msg" : "send_private_msg";
+                    string idKey = isGroup ? "group_id" : "user_id";
+                    var payload = new Dictionary<string, object>
+                    {
+                        ["action"] = action,
+                        ["params"] = new Dictionary<string, object>
+                        {
+                            [idKey] = target,
+                            ["message"] = new List<object>
+                            {
+                                new Dictionary<string, object>
+                                {
+                                    ["type"] = "json",
+                                    ["data"] = new Dictionary<string, object> { ["data"] = cardJson }
+                                }
+                            }
+                        },
+                        ["echo"] = echo
+                    };
+
+                    string payloadText = JsonSerializer.Serialize(payload);
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                    await _sharedWs.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(payloadText)), WebSocketMessageType.Text, true, cts.Token);
+
+                    byte[] recvBuf = new byte[64 * 1024];
+                    while (!cts.IsCancellationRequested)
+                    {
+                        var ms = new MemoryStream();
+                        WebSocketReceiveResult r;
+                        do
+                        {
+                            r = await _sharedWs.ReceiveAsync(new ArraySegment<byte>(recvBuf), cts.Token);
+                            if (r.MessageType == WebSocketMessageType.Close)
+                            {
+                                _sharedWs.Dispose();
+                                _sharedWs = null;
+                                return false;
+                            }
+                            ms.Write(recvBuf, 0, r.Count);
+                        } while (!r.EndOfMessage);
+
+                        string text = Encoding.UTF8.GetString(ms.ToArray());
+                        try
+                        {
+                            using var doc = JsonDocument.Parse(text);
+                            if (!doc.RootElement.TryGetProperty("echo", out var e) || e.GetString() != echo) continue;
+                            int ret = doc.RootElement.TryGetProperty("retcode", out var rc) ? rc.GetInt32() : -1;
+                            if (ret != 0) logger.LogWarning("协议端返回 " + ret);
+                            return ret == 0;
+                        }
+                        catch { }
+                    }
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    _sharedWs?.Dispose();
+                    _sharedWs = null;
+                    if (attempt == 1)
+                    {
+                        logger.LogWarning("发卡片失败：" + ex.Message);
+                        return false;
+                    }
+                }
+            }
+            return false;
+        }
+        finally
+        {
+            _wsLock.Release();
+        }
+    }
+
+    protected override Task OnAwake()
+    {
+        XmlHandler handler = new(this)
+        {
+            Description = "把网页链接或歌曲/视频做成QQ分享卡片并发送，并提供B站系列查询（解析/用户/更新/热门/登录）。",
+            Explanation = "搜索用 SearchMusic / SearchBili，发卡用 SendArkCard / SendShareCard；B站系列：BiliParse 解析链接、BiliUserInfo 查用户、BiliUpdates 查UP主更新、BiliHot 查热门、BiliQrLogin 扫码登录、BiliCookieRefresh 刷新登录态、BiliCookie 管理登录Cookie；IpLookup 查IP归属。都需要已配置第三方基地址和ApiKey。ProbeBase 探测三个签名/搜索接口通不通，ProbeAll 列出基地址下发现的所有接口。"
+        };
+        functionCaller.RegisterHandler(handler, DocumentMode.Implicit, cancellationToken: DestroyCancellationToken);
+        return Task.CompletedTask;
+    }
+
+    protected override async Task OnDestroy()
+    {
+        // 销毁/热重载时断开协议端连接、清掉探测缓存，避免连接泄漏
+        await _wsLock.WaitAsync();
+        try { _sharedWs?.Dispose(); _sharedWs = null; _sfx.Clear(); _discovered = false; }
+        finally { _wsLock.Release(); }
+    }
+}
