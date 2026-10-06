@@ -658,6 +658,42 @@ public class ShareArkModule(
         ? (v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : v.ValueKind == JsonValueKind.Number ? v.GetRawText() : "")
         : "";
 
+    static string GetStringField(JsonElement element, string fieldName)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return "";
+        }
+        if (element.TryGetProperty(fieldName, out JsonElement field) == false)
+        {
+            return "";
+        }
+        return field.ValueKind switch
+        {
+            JsonValueKind.String => field.GetString() ?? "",
+            JsonValueKind.Number => field.GetRawText(),
+            _ => ""
+        };
+    }
+
+    static long GetNumericField(JsonElement element, string fieldName)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return 0;
+        }
+        if (element.TryGetProperty(fieldName, out JsonElement field) == false)
+        {
+            return 0;
+        }
+        return field.ValueKind switch
+        {
+            JsonValueKind.Number => field.GetInt64(),
+            JsonValueKind.String => long.TryParse(field.GetString(), out long parsed) ? parsed : 0,
+            _ => 0
+        };
+    }
+
     // 功能开关检查：关闭时向AI说明并返回 true（调用方据此直接返回）
     bool Gate(bool enabled, string name)
     {
