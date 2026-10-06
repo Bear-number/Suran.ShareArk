@@ -4,7 +4,16 @@
 QQ 分享卡片插件（音乐卡 + 通用链接卡），签名由插件自己完成，直塞协议端 ws，不依赖协议端自带的签名地址配置。
 
 ## 版本
-4.5.0
+4.1.0
+
+## 官方容灾（4.1.0 新增）
+配置开关「容灾·启用官方接口回退」（默认开）：第三方接口调用失败时**自动切换官方公开接口**，双失败才报错（附双方原因）。
+- **音乐卡**：163/qq 走 OneBot 标准音乐段（`{"type":"music","data":{"type":"163"|"qq","id":...}}`，协议端原生生成卡片，歌名自动搜用平台公开接口）；bilibili/kugou 走 custom 音乐段（bilibili 的音频直链取自官方 playurl，kugou 降级为跳转卡）
+- **搜索**：163（music.163.com 搜索）、qq（c.y.qq.com smartbox）、kugou（mobilecdn.kugou.com v3）
+- **B站系列**：BiliParse（URL解析+view详情+playurl直链）、BiliUserInfo（wbi acc/info，自动WBI签名）、BiliUpdates（动态feed，仅视频投稿）、BiliHot（popular/related）、BiliQrLogin（passport扫码，**Cookie自动存本地**）、BiliCookie（本地管理）
+- Cookie 本地保存于 `{存储目录}/ShareArk/bili_cookie.txt`，官方接口自动携带以降低风控
+- 通用分享卡无官方替代（Ark签名必须第三方），第三方不可用时明确报错
+
 
 ## 依赖
 - Alife.Function.FunctionCaller

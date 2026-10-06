@@ -1,16 +1,19 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.WebSockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
+using Alife.Foundation;
 using Alife.Function.FunctionCaller;
 using Alife.Framework;
 using Microsoft.Extensions.Logging;
@@ -46,6 +49,10 @@ public class ShareArkConfig
     [DisplayName("B站搜索接口地址")]
     [Description("B站视频搜索接口完整地址，可留空，留空走B站官方接口。第三方返回需为 {code,data:[{id,title}]} 结构")]
     public string BiliSearchUrl { get; set; } = "";
+
+    [DisplayName("容灾·启用官方接口回退")]
+    [Description("第三方接口调用失败时自动改用官方公开接口（音乐卡走官方音乐段、B站系列走B站web接口、搜索走平台公开接口）")]
+    public bool EnableOfficialFallback { get; set; } = true;
 
     // ── 功能开关：关闭后对应函数对AI不可用（默认全开，老配置缺省即开） ──
     [DisplayName("开关·搜歌")] [Description("关闭后 SearchMusic 不可用")]
@@ -408,10 +415,10 @@ public class ShareArkModule(
         [Description("平台：163(网易云)/qq(QQ音乐)/kugou(酷狗)，默认163")] string? platform = null)
     {
         if (Gate(Configuration.EnableSearchMusic, "搜歌")) return;
+        string pf = (platform ?? "163").Trim().ToLowerInvariant();
+        if (pf == "netease") pf = "163";
         try
         {
-            string pf = (platform ?? "163").Trim().ToLowerInvariant();
-            if (pf == "netease") pf = "163";
             if (pf != "163" && pf != "qq" && pf != "kugou")
                 throw new Exception("搜索只支持 163/qq/kugou");
             await EnsureFit();
@@ -438,7 +445,25 @@ public class ShareArkModule(
             if (lines.Count == 0) lines.Add("没搜到");
             interactor.Poke(string.Join("\n", lines));
         }
-        catch (Exception ex) { interactor.Poke("搜索失败：" + ex.Message); }
+        catch (Exception thirdPartyError)
+        {
+            if (Configuration.EnableOfficialFallback == false)
+            {
+                interactor.Poke("搜索失败：" + thirdPartyError.Message);
+                return;
+            }
+            try
+            {
+                List<(string Id, string Name, string Singer)> results = await OfficialSearchAsync(pf, keyword);
+                List<string> lines = results.Select(r => r.Id + " | " + r.Name + (r.Singer.Length > 0 ? " - " + r.Singer : "")).ToList();
+                if (lines.Count == 0) lines.Add("没搜到");
+                interactor.Poke("ℹ️ 第三方接口不可用（" + thirdPartyError.Message + "），已切换官方接口。\n" + string.Join("\n", lines));
+            }
+            catch (Exception officialError)
+            {
+                interactor.Poke("❌ 搜索：第三方（" + thirdPartyError.Message + "）；官方容灾（" + officialError.Message + "）");
+            }
+        }
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -456,24 +481,35 @@ public class ShareArkModule(
         catch (Exception ex) { interactor.Poke("搜索失败：" + ex.Message); }
     }
 
-    // B站视频搜索统一入口：配置了第三方接口走 {code,data:[{id,title}]}，否则走B站官方，都归一成 (BV号, 标题) 列表
+    // B站视频搜索统一入口：配置了第三方接口优先走第三方（失败按容灾配置转官方），否则走B站官方，都归一成 (BV号, 标题) 列表
     async Task<List<(string bv, string title)>> BiliSearchAsync(string keyword)
     {
         var list = new List<(string, string)>();
         if (!string.IsNullOrWhiteSpace(Configuration.BiliSearchUrl))
         {
-            string u = WithQuery(Configuration.BiliSearchUrl.Trim(), KeyQ() + "msg=" + Uri.EscapeDataString(keyword));
-            string body = await http.GetStringAsync(u);
-            using var doc = JsonDocument.Parse(body);
-            if (doc.RootElement.GetProperty("code").GetInt32() != 200)
-                throw new Exception(doc.RootElement.TryGetProperty("msg", out var mm) ? mm.GetString() ?? "" : "搜索失败");
-            foreach (var v in doc.RootElement.GetProperty("data").EnumerateArray())
+            try
             {
-                string bv = v.TryGetProperty("id", out var iv) ? iv.GetString() ?? "" : "";
-                string t = v.TryGetProperty("title", out var tv) ? Regex.Replace(tv.GetString() ?? "", "<[^>]*>", "") : "";
-                if (bv.Length > 0) list.Add((bv, t));
+                string u = WithQuery(Configuration.BiliSearchUrl.Trim(), KeyQ() + "msg=" + Uri.EscapeDataString(keyword));
+                string body = await http.GetStringAsync(u);
+                using var doc = JsonDocument.Parse(body);
+                if (doc.RootElement.GetProperty("code").GetInt32() != 200)
+                    throw new Exception(doc.RootElement.TryGetProperty("msg", out var mm) ? mm.GetString() ?? "" : "搜索失败");
+                foreach (var v in doc.RootElement.GetProperty("data").EnumerateArray())
+                {
+                    string bv = v.TryGetProperty("id", out var iv) ? iv.GetString() ?? "" : "";
+                    string t = v.TryGetProperty("title", out var tv) ? Regex.Replace(tv.GetString() ?? "", "<[^>]*>", "") : "";
+                    if (bv.Length > 0) list.Add((bv, t));
+                }
+                return list;
             }
-            return list;
+            catch (Exception thirdPartyError)
+            {
+                if (Configuration.EnableOfficialFallback == false)
+                {
+                    throw;
+                }
+                // 容灾：第三方失败转B站官方搜索
+            }
         }
         string ou = "https://api.bilibili.com/x/web-interface/search/all/v2?keyword=" + Uri.EscapeDataString(keyword);
         using var req = new HttpRequestMessage(HttpMethod.Get, ou);
@@ -511,11 +547,31 @@ public class ShareArkModule(
             string card = await SignAsync(platform, id, title);
             bool ok = await SendJsonAsync(target, isGroup, card);
             if (ok) interactor.Poke("卡片已发出"); else interactor.Poke("卡片没发出去");
+            return;
         }
-        catch (Exception ex)
+        catch (Exception signError)
         {
-            logger.LogWarning("发卡片失败：" + ex.Message);
-            interactor.Poke("发卡片失败：" + ex.Message);
+            if (Configuration.EnableOfficialFallback == false)
+            {
+                logger.LogWarning("发卡片失败：" + signError.Message);
+                interactor.Poke("发卡片失败：" + signError.Message);
+                return;
+            }
+            // 官方容灾：改用 OneBot 标准音乐段（163/qq 官方模板，kugou/bilibili custom）
+            try
+            {
+                JsonObject musicSegment = await BuildOfficialMusicSegmentAsync(platform, id, title);
+                JsonArray segments = new();
+                segments.Add(musicSegment);
+                bool ok = await SendSegmentsAsync(target, isGroup, segments);
+                if (ok) interactor.Poke("✅ 卡片已发出（第三方签名失败，官方音乐段容灾）");
+                else interactor.Poke("卡片没发出去（官方容灾）");
+            }
+            catch (Exception officialError)
+            {
+                logger.LogWarning("发卡片失败：第三方 {Third}；官方容灾 {Official}", signError.Message, officialError.Message);
+                interactor.Poke("❌ 发卡片：第三方（" + signError.Message + "）；官方容灾（" + officialError.Message + "）");
+            }
         }
     }
 
@@ -620,36 +676,44 @@ public class ShareArkModule(
         if (Gate(Configuration.EnableBiliParse, "B站链接解析")) return;
         try
         {
-            var d = await ApiCall("bili-url-parse", ("url", url), ("action", action), ("qn", qn?.ToString()));
-            var rep = new List<string> { "类型 " + S(d, "type") + "，ID " + S(d, "id") };
-            string title = S(d, "title");
-            if (title.Length > 0) rep.Add(title);
-            if (d.TryGetProperty("owner", out var ow) && ow.ValueKind == JsonValueKind.Object)
-                rep.Add("UP主 " + S(ow, "name"));
-            if (d.TryGetProperty("author", out var au) && au.ValueKind == JsonValueKind.Object)
-                rep.Add("作者 " + S(au, "name"));
-            if (d.TryGetProperty("stat", out var st) && st.ValueKind == JsonValueKind.Object)
-                rep.Add("播放 " + S(st, "view") + "，点赞 " + S(st, "like") + "，评论 " + S(st, "reply"));
-            if (S(d, "duration_text").Length > 0) rep.Add("时长 " + S(d, "duration_text"));
-            if (d.TryGetProperty("rating", out var rt) && rt.ValueKind == JsonValueKind.Number) rep.Add("评分 " + rt.GetDouble());
-            if (d.TryGetProperty("ep_count", out var ec) && ec.ValueKind == JsonValueKind.Number) rep.Add("共 " + ec.GetInt32() + " 集");
-            if (action == "play")
-            {
-                if (d.TryGetProperty("play", out var play))
-                {
-                    if (play.TryGetProperty("quality_desc", out var qd)) rep.Add("清晰度 " + qd.GetString());
-                    string? direct = null;
-                    if (play.TryGetProperty("no_referer_url", out var nru) && nru.ValueKind == JsonValueKind.String) direct = nru.GetString();
-                    else if (play.TryGetProperty("durl", out var dl) && dl.ValueKind == JsonValueKind.Array && dl.GetArrayLength() > 0) direct = dl[0].GetString();
-                    else if (play.TryGetProperty("dash", out var dash) && dash.TryGetProperty("video", out var vd) && vd.ValueKind == JsonValueKind.Array && vd.GetArrayLength() > 0)
-                        direct = vd[0].TryGetProperty("base_url", out var bu) ? bu.GetString() : null;
-                    if (!string.IsNullOrEmpty(direct)) rep.Add("直链 " + direct);
-                }
-            }
-            rep.Add("链接 " + S(d, "web_url"));
-            interactor.Poke(string.Join("\n", rep));
+            interactor.Poke(await BiliParseThirdPartyAsync(url, action, qn));
         }
-        catch (Exception ex) { interactor.Poke("解析失败：" + ex.Message); }
+        catch (Exception thirdPartyError)
+        {
+            await FallbackOrReportAsync("解析", thirdPartyError, () => OfficialBiliParseAsync(url, action, qn));
+        }
+    }
+
+    async Task<string> BiliParseThirdPartyAsync(string url, string? action, int? qn)
+    {
+        var d = await ApiCall("bili-url-parse", ("url", url), ("action", action), ("qn", qn?.ToString()));
+        var rep = new List<string> { "类型 " + S(d, "type") + "，ID " + S(d, "id") };
+        string title = S(d, "title");
+        if (title.Length > 0) rep.Add(title);
+        if (d.TryGetProperty("owner", out var ow) && ow.ValueKind == JsonValueKind.Object)
+            rep.Add("UP主 " + S(ow, "name"));
+        if (d.TryGetProperty("author", out var au) && au.ValueKind == JsonValueKind.Object)
+            rep.Add("作者 " + S(au, "name"));
+        if (d.TryGetProperty("stat", out var st) && st.ValueKind == JsonValueKind.Object)
+            rep.Add("播放 " + S(st, "view") + "，点赞 " + S(st, "like") + "，评论 " + S(st, "reply"));
+        if (S(d, "duration_text").Length > 0) rep.Add("时长 " + S(d, "duration_text"));
+        if (d.TryGetProperty("rating", out var rt) && rt.ValueKind == JsonValueKind.Number) rep.Add("评分 " + rt.GetDouble());
+        if (d.TryGetProperty("ep_count", out var ec) && ec.ValueKind == JsonValueKind.Number) rep.Add("共 " + ec.GetInt32() + " 集");
+        if (action == "play")
+        {
+            if (d.TryGetProperty("play", out var play))
+            {
+                if (play.TryGetProperty("quality_desc", out var qd)) rep.Add("清晰度 " + qd.GetString());
+                string? direct = null;
+                if (play.TryGetProperty("no_referer_url", out var nru) && nru.ValueKind == JsonValueKind.String) direct = nru.GetString();
+                else if (play.TryGetProperty("durl", out var dl) && dl.ValueKind == JsonValueKind.Array && dl.GetArrayLength() > 0) direct = dl[0].GetString();
+                else if (play.TryGetProperty("dash", out var dash) && dash.TryGetProperty("video", out var vd) && vd.ValueKind == JsonValueKind.Array && vd.GetArrayLength() > 0)
+                    direct = vd[0].TryGetProperty("base_url", out var bu) ? bu.GetString() : null;
+                if (!string.IsNullOrEmpty(direct)) rep.Add("直链 " + direct);
+            }
+        }
+        rep.Add("链接 " + S(d, "web_url"));
+        return string.Join("\n", rep);
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -659,19 +723,27 @@ public class ShareArkModule(
         if (Gate(Configuration.EnableBiliUserInfo, "B站用户查询")) return;
         try
         {
-            var d = await ApiCall("bili-user-info", ("uid", uid.ToString()));
-            var rep = new List<string> { S(d, "name") + "（" + S(d, "mid") + "）" };
-            string vip = S(d, "vip_label");
-            rep.Add("等级 " + S(d, "level") + (vip.Length > 0 ? "，" + vip : ""));
-            rep.Add("粉丝 " + S(d, "fans") + "，关注 " + S(d, "following") + "，获赞 " + S(d, "likes"));
-            rep.Add("投稿视频 " + S(d, "archive_count") + "，专栏 " + S(d, "article_count"));
-            string sign = S(d, "sign");
-            if (sign.Length > 0) rep.Add("签名：" + sign);
-            if (d.TryGetProperty("official", out var of) && of.ValueKind == JsonValueKind.Object && S(of, "title").Length > 0)
-                rep.Add("认证：" + S(of, "title"));
-            interactor.Poke(string.Join("\n", rep));
+            interactor.Poke(await BiliUserInfoThirdPartyAsync(uid));
         }
-        catch (Exception ex) { interactor.Poke("查询失败：" + ex.Message); }
+        catch (Exception thirdPartyError)
+        {
+            await FallbackOrReportAsync("用户查询", thirdPartyError, () => OfficialBiliUserInfoAsync(uid));
+        }
+    }
+
+    async Task<string> BiliUserInfoThirdPartyAsync(long uid)
+    {
+        var d = await ApiCall("bili-user-info", ("uid", uid.ToString()));
+        var rep = new List<string> { S(d, "name") + "（" + S(d, "mid") + "）" };
+        string vip = S(d, "vip_label");
+        rep.Add("等级 " + S(d, "level") + (vip.Length > 0 ? "，" + vip : ""));
+        rep.Add("粉丝 " + S(d, "fans") + "，关注 " + S(d, "following") + "，获赞 " + S(d, "likes"));
+        rep.Add("投稿视频 " + S(d, "archive_count") + "，专栏 " + S(d, "article_count"));
+        string sign = S(d, "sign");
+        if (sign.Length > 0) rep.Add("签名：" + sign);
+        if (d.TryGetProperty("official", out var of) && of.ValueKind == JsonValueKind.Object && S(of, "title").Length > 0)
+            rep.Add("认证：" + S(of, "title"));
+        return string.Join("\n", rep);
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -684,20 +756,28 @@ public class ShareArkModule(
         if (Gate(Configuration.EnableBiliUpdates, "UP主更新查询")) return;
         try
         {
-            var d = await ApiCall("bili-user-update", ("uid", uid.ToString()), ("type", type ?? "all"), ("offset", offset));
-            var rep = new List<string>();
-            foreach (var it in d.GetProperty("items").EnumerateArray())
-            {
-                string line = S(it, "pub_time_text") + " " + (S(it, "title").Length > 0 ? S(it, "title") : S(it, "summary"));
-                if (S(it, "bvid").Length > 0) line += "（" + S(it, "bvid") + "）";
-                rep.Add(line);
-            }
-            if (rep.Count == 0) rep.Add("没有更新");
-            if (d.TryGetProperty("has_more", out var hm) && hm.ValueKind == JsonValueKind.True && S(d, "next_offset").Length > 0)
-                rep.Add("还有更多，用 offset=" + S(d, "next_offset") + " 翻页");
-            interactor.Poke(string.Join("\n", rep));
+            interactor.Poke(await BiliUpdatesThirdPartyAsync(uid, type, offset));
         }
-        catch (Exception ex) { interactor.Poke("查询失败：" + ex.Message); }
+        catch (Exception thirdPartyError)
+        {
+            await FallbackOrReportAsync("更新查询", thirdPartyError, () => OfficialBiliUpdatesAsync(uid));
+        }
+    }
+
+    async Task<string> BiliUpdatesThirdPartyAsync(long uid, string? type, string? offset)
+    {
+        var d = await ApiCall("bili-user-update", ("uid", uid.ToString()), ("type", type ?? "all"), ("offset", offset));
+        var rep = new List<string>();
+        foreach (var it in d.GetProperty("items").EnumerateArray())
+        {
+            string line = S(it, "pub_time_text") + " " + (S(it, "title").Length > 0 ? S(it, "title") : S(it, "summary"));
+            if (S(it, "bvid").Length > 0) line += "（" + S(it, "bvid") + "）";
+            rep.Add(line);
+        }
+        if (rep.Count == 0) rep.Add("没有更新");
+        if (d.TryGetProperty("has_more", out var hm) && hm.ValueKind == JsonValueKind.True && S(d, "next_offset").Length > 0)
+            rep.Add("还有更多，用 offset=" + S(d, "next_offset") + " 翻页");
+        return string.Join("\n", rep);
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -710,23 +790,31 @@ public class ShareArkModule(
         if (Gate(Configuration.EnableBiliHot, "B站热门/相关")) return;
         try
         {
-            string a = (action ?? "popular").Trim().ToLowerInvariant();
-            var d = await ApiCall("bili-hot-recommend", ("action", a), ("bvid", bvid), ("pn", pn?.ToString()));
-            var rep = new List<string>();
-            int n = 0;
-            foreach (var it in d.GetProperty("items").EnumerateArray())
-            {
-                if (n >= 10) break;
-                string line = (it.TryGetProperty("ranking", out var rk) ? rk.GetInt32() + ". " : "") + S(it, "bvid") + " - " + S(it, "title");
-                if (it.TryGetProperty("owner", out var ow2) && ow2.ValueKind == JsonValueKind.Object) line += " - " + S(ow2, "name");
-                if (S(it, "view_text").Length > 0) line += " [" + S(it, "view_text") + "播放]";
-                rep.Add(line);
-                n++;
-            }
-            if (rep.Count == 0) rep.Add("没有内容");
-            interactor.Poke(string.Join("\n", rep));
+            interactor.Poke(await BiliHotThirdPartyAsync(action, bvid, pn));
         }
-        catch (Exception ex) { interactor.Poke("查询失败：" + ex.Message); }
+        catch (Exception thirdPartyError)
+        {
+            await FallbackOrReportAsync("热门/相关查询", thirdPartyError, () => OfficialBiliHotAsync(action, bvid, pn));
+        }
+    }
+
+    async Task<string> BiliHotThirdPartyAsync(string? action, string? bvid, int? pn)
+    {
+        string a = (action ?? "popular").Trim().ToLowerInvariant();
+        var d = await ApiCall("bili-hot-recommend", ("action", a), ("bvid", bvid), ("pn", pn?.ToString()));
+        var rep = new List<string>();
+        int n = 0;
+        foreach (var it in d.GetProperty("items").EnumerateArray())
+        {
+            if (n >= 10) break;
+            string line = (it.TryGetProperty("ranking", out var rk) ? rk.GetInt32() + ". " : "") + S(it, "bvid") + " - " + S(it, "title");
+            if (it.TryGetProperty("owner", out var ow2) && ow2.ValueKind == JsonValueKind.Object) line += " - " + S(ow2, "name");
+            if (S(it, "view_text").Length > 0) line += " [" + S(it, "view_text") + "播放]";
+            rep.Add(line);
+            n++;
+        }
+        if (rep.Count == 0) rep.Add("没有内容");
+        return string.Join("\n", rep);
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -738,19 +826,24 @@ public class ShareArkModule(
         if (Gate(Configuration.EnableBiliQrLogin, "B站扫码登录")) return;
         try
         {
-            var d = await ApiCall("bili-qrcode-login", ("action", action), ("qrcode_key", qrcodeKey));
-            if (action == "generate")
-                interactor.Poke("qrcode_key " + S(d, "qrcode_key") + "\n二维码链接（180秒内有效，打开后扫码）：\n" + S(d, "qrcode_url") + "\n扫完后用 action=poll、qrcode_key 查结果");
-            else
-            {
-                string status = S(d, "status");
-                string msg = S(d, "message").Length > 0 ? S(d, "message") : status;
-                if (status == "success")
-                    msg += "\ncookie_id " + S(d, "cookie_id") + "，用户 " + S(d, "uname") + "，有效期至 " + S(d, "expire_at");
-                interactor.Poke(msg);
-            }
+            interactor.Poke(await BiliQrLoginThirdPartyAsync(action, qrcodeKey));
         }
-        catch (Exception ex) { interactor.Poke("登录流程失败：" + ex.Message); }
+        catch (Exception thirdPartyError)
+        {
+            await FallbackOrReportAsync("扫码登录", thirdPartyError, () => OfficialBiliQrLoginAsync(action, qrcodeKey));
+        }
+    }
+
+    async Task<string> BiliQrLoginThirdPartyAsync(string action, string? qrcodeKey)
+    {
+        var d = await ApiCall("bili-qrcode-login", ("action", action), ("qrcode_key", qrcodeKey));
+        if (action == "generate")
+            return "qrcode_key " + S(d, "qrcode_key") + "\n二维码链接（180秒内有效，打开后扫码）：\n" + S(d, "qrcode_url") + "\n扫完后用 action=poll、qrcode_key 查结果";
+        string status = S(d, "status");
+        string msg = S(d, "message").Length > 0 ? S(d, "message") : status;
+        if (status == "success")
+            msg += "\ncookie_id " + S(d, "cookie_id") + "，用户 " + S(d, "uname") + "，有效期至 " + S(d, "expire_at");
+        return msg;
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -762,13 +855,22 @@ public class ShareArkModule(
         if (Gate(Configuration.EnableBiliCookieRefresh, "Cookie刷新")) return;
         try
         {
-            var d = await ApiCall("bili-cookie-refresh", ("cookie_id", cookieId), ("action", action));
-            bool refreshed = d.TryGetProperty("refreshed", out var rf) && rf.ValueKind == JsonValueKind.True;
-            string extra = refreshed ? "已刷新，新有效期至 " + S(d, "new_expire_at")
-                : S(d, "message").Length > 0 ? S(d, "message") : "未刷新";
-            interactor.Poke("Cookie " + S(d, "cookie_id") + " " + extra);
+            interactor.Poke(await BiliCookieRefreshThirdPartyAsync(cookieId, action));
         }
-        catch (Exception ex) { interactor.Poke("刷新失败：" + ex.Message); }
+        catch (Exception thirdPartyError)
+        {
+            await FallbackOrReportAsync("Cookie刷新", thirdPartyError, () =>
+                Task.FromResult("官方容灾暂不支持Cookie刷新（B站官方刷新流程复杂），请改用 BiliQrLogin 重新扫码登录，或恢复第三方服务后重试"));
+        }
+    }
+
+    async Task<string> BiliCookieRefreshThirdPartyAsync(string cookieId, string? action)
+    {
+        var d = await ApiCall("bili-cookie-refresh", ("cookie_id", cookieId), ("action", action));
+        bool refreshed = d.TryGetProperty("refreshed", out var rf) && rf.ValueKind == JsonValueKind.True;
+        string extra = refreshed ? "已刷新，新有效期至 " + S(d, "new_expire_at")
+            : S(d, "message").Length > 0 ? S(d, "message") : "未刷新";
+        return "Cookie " + S(d, "cookie_id") + " " + extra;
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -781,33 +883,36 @@ public class ShareArkModule(
         if (Gate(Configuration.EnableBiliCookie, "Cookie管理")) return;
         try
         {
-            string a = (action ?? "list").Trim().ToLowerInvariant();
-            var d = await ApiCall("bili-user-cookie", ("action", a), ("cookie_id", cookieId), ("cookie_string", cookieString));
-            switch (a)
-            {
-                case "list":
-                    var rep = new List<string>();
-                    foreach (var it in d.GetProperty("items").EnumerateArray())
-                        rep.Add(S(it, "cookie_id") + " " + S(it, "uname") + "（" + S(it, "uid") + "）有效期至 " + S(it, "expire_at") + "，已用 " + S(it, "use_count") + " 次");
-                    if (rep.Count == 0) rep.Add("没有保存的Cookie");
-                    interactor.Poke(string.Join("\n", rep));
-                    break;
-                case "check":
-                    bool valid = d.TryGetProperty("valid", out var vv) && vv.ValueKind == JsonValueKind.True;
-                    interactor.Poke("Cookie " + S(d, "cookie_id") + " " + (valid ? "登录态有效：" + S(d, "uname") + "（" + S(d, "uid") + "）" : "无效：" + S(d, "message")));
-                    break;
-                case "delete":
-                    interactor.Poke("Cookie " + S(d, "cookie_id") + (d.TryGetProperty("deleted", out var del) && del.ValueKind == JsonValueKind.True ? " 已删除" : " 删除失败"));
-                    break;
-                case "save":
-                    interactor.Poke("已导入，cookie_id " + S(d, "cookie_id") + "，用户 " + S(d, "uname") + "，有效期至 " + S(d, "expire_at"));
-                    break;
-                default:
-                    interactor.Poke("不支持的action：" + a + "（可用 list/check/delete/save）");
-                    break;
-            }
+            interactor.Poke(await BiliCookieThirdPartyAsync(action, cookieId, cookieString));
         }
-        catch (Exception ex) { interactor.Poke("操作失败：" + ex.Message); }
+        catch (Exception thirdPartyError)
+        {
+            await FallbackOrReportAsync("Cookie管理", thirdPartyError, () => OfficialBiliCookieAsync(action, cookieString));
+        }
+    }
+
+    async Task<string> BiliCookieThirdPartyAsync(string? action, string? cookieId, string? cookieString)
+    {
+        string a = (action ?? "list").Trim().ToLowerInvariant();
+        var d = await ApiCall("bili-user-cookie", ("action", a), ("cookie_id", cookieId), ("cookie_string", cookieString));
+        switch (a)
+        {
+            case "list":
+                var rep = new List<string>();
+                foreach (var it in d.GetProperty("items").EnumerateArray())
+                    rep.Add(S(it, "cookie_id") + " " + S(it, "uname") + "（" + S(it, "uid") + "）有效期至 " + S(it, "expire_at") + "，已用 " + S(it, "use_count") + " 次");
+                if (rep.Count == 0) rep.Add("没有保存的Cookie");
+                return string.Join("\n", rep);
+            case "check":
+                bool valid = d.TryGetProperty("valid", out var vv) && vv.ValueKind == JsonValueKind.True;
+                return "Cookie " + S(d, "cookie_id") + " " + (valid ? "登录态有效：" + S(d, "uname") + "（" + S(d, "uid") + "）" : "无效：" + S(d, "message"));
+            case "delete":
+                return "Cookie " + S(d, "cookie_id") + (d.TryGetProperty("deleted", out var del) && del.ValueKind == JsonValueKind.True ? " 已删除" : " 删除失败");
+            case "save":
+                return "已导入，cookie_id " + S(d, "cookie_id") + "，用户 " + S(d, "uname") + "，有效期至 " + S(d, "expire_at");
+            default:
+                return "不支持的action：" + a + "（可用 list/check/delete/save）";
+        }
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -829,6 +934,597 @@ public class ShareArkModule(
             interactor.Poke(string.Join("\n", rep));
         }
         catch (Exception ex) { interactor.Poke("查询失败：" + ex.Message); }
+    }
+
+    // ============================================================
+    // 官方容灾：第三方失败时自动切换官方公开接口
+    // ============================================================
+
+    // 统一容灾路由：未开启容灾时只报第三方错误；开启则执行官方实现，双失败报双原因
+    async Task FallbackOrReportAsync(string name, Exception thirdPartyError, Func<Task<string>> officialFallback)
+    {
+        if (Configuration.EnableOfficialFallback == false)
+        {
+            interactor.Poke("❌ " + name + "失败：" + thirdPartyError.Message);
+            return;
+        }
+        try
+        {
+            interactor.Poke("ℹ️ 第三方接口不可用（" + thirdPartyError.Message + "），已切换官方接口。\n" + await officialFallback());
+        }
+        catch (Exception officialError)
+        {
+            interactor.Poke("❌ " + name + "：第三方（" + thirdPartyError.Message + "）；官方容灾（" + officialError.Message + "）");
+        }
+    }
+
+    // ---- 本地B站Cookie（扫码登录成功后保存，供官方接口降低风控） ----
+    string BiliCookieFilePath() => Path.Combine(AlifePath.StorageFolderPath, "ShareArk", "bili_cookie.txt");
+
+    string LoadBiliCookie()
+    {
+        try
+        {
+            string path = BiliCookieFilePath();
+            return File.Exists(path) ? File.ReadAllText(path).Trim() : "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    void SaveBiliCookie(string cookie)
+    {
+        string path = BiliCookieFilePath();
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, cookie.Trim());
+    }
+
+    // ---- B站官方GET基座 ----
+    const string BiliApiBase = "https://api.bilibili.com";
+    const string BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+    async Task<JsonElement> BiliOfficialGetAsync(string url)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Get, url);
+        request.Headers.Referrer = new Uri("https://www.bilibili.com/");
+        string cookie = LoadBiliCookie();
+        request.Headers.TryAddWithoutValidation("Cookie", (cookie.Length > 0 ? cookie + "; " : "") + "buvid3=1; b_nut=1");
+        request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
+        string body = await (await http.SendAsync(request)).Content.ReadAsStringAsync();
+        using JsonDocument parsed = JsonDocument.Parse(body);
+        JsonElement root = parsed.RootElement.Clone();
+        int code = root.TryGetProperty("code", out JsonElement codeElement) && codeElement.ValueKind == JsonValueKind.Number
+            ? codeElement.GetInt32()
+            : -1;
+        if (code != 0)
+        {
+            string detail = root.TryGetProperty("message", out JsonElement messageElement) && messageElement.ValueKind == JsonValueKind.String
+                ? messageElement.GetString() ?? ""
+                : "";
+            throw new Exception("B站接口返回 " + code + (detail.Length > 0 ? "：" + detail : ""));
+        }
+        return root.TryGetProperty("data", out JsonElement dataElement) ? dataElement.Clone() : JsonDocument.Parse("null").RootElement.Clone();
+    }
+
+    // ---- WBI 签名（用户信息/投稿搜索接口需要） ----
+    static readonly int[] WbiMixinTable = { 46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52 };
+    string wbiMixinKey = "";
+    DateTime wbiKeyFetchedTime = DateTime.MinValue;
+
+    async Task<string> GetWbiMixinKeyAsync()
+    {
+        if (wbiMixinKey.Length > 0 && (DateTime.Now - wbiKeyFetchedTime).TotalHours < 24)
+        {
+            return wbiMixinKey;
+        }
+        JsonElement nav = await BiliOfficialGetAsync(BiliApiBase + "/x/web-interface/nav");
+        JsonElement wbiImg = nav.GetProperty("wbi_img");
+        string imgKey = GetStringField(wbiImg, "img_url").Split('/').Last().Split('.')[0];
+        string subKey = GetStringField(wbiImg, "sub_url").Split('/').Last().Split('.')[0];
+        string rawKey = imgKey + subKey;
+        char[] mixin = new char[32];
+        for (int i = 0; i < 32; i++)
+        {
+            mixin[i] = rawKey[WbiMixinTable[i]];
+        }
+        wbiMixinKey = new string(mixin);
+        wbiKeyFetchedTime = DateTime.Now;
+        return wbiMixinKey;
+    }
+
+    static string Md5Hex(string text)
+    {
+        return Convert.ToHexString(MD5.HashData(Encoding.UTF8.GetBytes(text))).ToLowerInvariant();
+    }
+
+    static string FilterWbiValue(string value)
+    {
+        return Regex.Replace(value, "[!'()*]", "");
+    }
+
+    // 对参数做 WBI 签名，返回带 w_rid/wts 的最终查询串
+    async Task<string> BuildWbiQueryAsync(Dictionary<string, string> parameters)
+    {
+        string mixinKey = await GetWbiMixinKeyAsync();
+        parameters["wts"] = DateTimeOffset.Now.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
+        string query = string.Join("&", parameters
+            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair => Uri.EscapeDataString(pair.Key) + "=" + Uri.EscapeDataString(FilterWbiValue(pair.Value))));
+        return query + "&w_rid=" + Md5Hex(query + mixinKey);
+    }
+
+    // ---- BiliParse 官方实现：URL解析 + view 详情 + playurl 直链 ----
+    async Task<string> OfficialBiliParseAsync(string url, string? action, int? qn)
+    {
+        string workUrl = url.Trim();
+        if (workUrl.Contains("b23.tv"))
+        {
+            try
+            {
+                using HttpResponseMessage redirectResponse = await http.GetAsync(workUrl);
+                string? finalUrl = redirectResponse.RequestMessage?.RequestUri?.ToString();
+                if (string.IsNullOrEmpty(finalUrl) == false)
+                {
+                    workUrl = finalUrl;
+                }
+            }
+            catch
+            {
+                // 短链解析失败则按原文解析
+            }
+        }
+
+        string bvid = Regex.Match(workUrl, "BV[0-9A-Za-z]{10}").Value;
+        Match articleMatch = Regex.Match(workUrl, "cv([0-9]+)");
+        Match seasonMatch = Regex.Match(workUrl, "ss([0-9]+)");
+        Match liveMatch = Regex.Match(workUrl, @"live\.bilibili\.com/([0-9]+)");
+
+        if (bvid.Length == 12)
+        {
+            var rep = new List<string> { "类型 video，ID " + bvid };
+            if (action == "id")
+            {
+                rep.Add("链接 https://www.bilibili.com/video/" + bvid);
+                return string.Join("\n", rep);
+            }
+            JsonElement view = await BiliOfficialGetAsync(BiliApiBase + "/x/web-interface/view?bvid=" + bvid);
+            rep.Add(S(view, "title"));
+            if (view.TryGetProperty("owner", out JsonElement owner) && owner.ValueKind == JsonValueKind.Object)
+            {
+                rep.Add("UP主 " + S(owner, "name"));
+            }
+            if (view.TryGetProperty("stat", out JsonElement stat) && stat.ValueKind == JsonValueKind.Object)
+            {
+                rep.Add("播放 " + S(stat, "view") + "，点赞 " + S(stat, "like") + "，评论 " + S(stat, "reply"));
+            }
+            rep.Add("时长 " + FormatSeconds(GetNumericField(view, "duration")));
+            rep.Add("链接 https://www.bilibili.com/video/" + bvid);
+            if (action == "play")
+            {
+                try
+                {
+                    long cid = GetNumericField(view, "cid");
+                    JsonElement play = await BiliOfficialGetAsync(BiliApiBase + "/x/player/playurl?bvid=" + bvid
+                        + "&cid=" + cid + "&qn=" + (qn ?? 80) + "&fnval=16");
+                    string? direct = null;
+                    if (play.TryGetProperty("durl", out JsonElement durl) && durl.ValueKind == JsonValueKind.Array && durl.GetArrayLength() > 0)
+                    {
+                        direct = durl[0].TryGetProperty("url", out JsonElement durlUrl) ? durlUrl.GetString() : null;
+                    }
+                    else if (play.TryGetProperty("dash", out JsonElement dash)
+                        && dash.TryGetProperty("video", out JsonElement dashVideo)
+                        && dashVideo.ValueKind == JsonValueKind.Array && dashVideo.GetArrayLength() > 0)
+                    {
+                        direct = dashVideo[0].TryGetProperty("base_url", out JsonElement baseUrl) ? baseUrl.GetString() : null;
+                    }
+                    rep.Add(string.IsNullOrEmpty(direct) ? "直链获取失败（高清晰度可能需要登录态）" : "直链 " + direct);
+                }
+                catch (Exception playError)
+                {
+                    rep.Add("直链获取失败：" + playError.Message);
+                }
+            }
+            return string.Join("\n", rep);
+        }
+        if (liveMatch.Success)
+        {
+            return "类型 live，ID " + liveMatch.Groups[1].Value + "\n链接 https://live.bilibili.com/" + liveMatch.Groups[1].Value;
+        }
+        if (seasonMatch.Success)
+        {
+            return "类型 bangumi，ID ss" + seasonMatch.Groups[1].Value + "\n链接 https://www.bilibili.com/bangumi/play/ss" + seasonMatch.Groups[1].Value;
+        }
+        if (articleMatch.Success)
+        {
+            return "类型 article，ID cv" + articleMatch.Groups[1].Value + "\n链接 https://www.bilibili.com/read/cv" + articleMatch.Groups[1].Value
+                + "\n（官方容灾不提供专栏详情）";
+        }
+        throw new Exception("无法从链接中识别B站资源（支持视频/短链/专栏/番剧/直播间）");
+    }
+
+    // ---- BiliUserInfo 官方实现：wbi acc/info + relation/stat ----
+    async Task<string> OfficialBiliUserInfoAsync(long uid)
+    {
+        Dictionary<string, string> parameters = new() { ["mid"] = uid.ToString(CultureInfo.InvariantCulture) };
+        string query = await BuildWbiQueryAsync(parameters);
+        JsonElement info = await BiliOfficialGetAsync(BiliApiBase + "/x/space/wbi/acc/info?" + query);
+        JsonElement relation = await BiliOfficialGetAsync(BiliApiBase + "/x/relation/stat?vmid=" + uid.ToString(CultureInfo.InvariantCulture));
+        var rep = new List<string> { S(info, "name") + "（" + S(info, "mid") + "）" };
+        rep.Add("等级 " + S(info, "level"));
+        rep.Add("粉丝 " + S(relation, "follower"));
+        string sign = S(info, "sign");
+        if (sign.Length > 0) rep.Add("签名：" + sign);
+        if (info.TryGetProperty("official", out JsonElement official) && official.ValueKind == JsonValueKind.Object && S(official, "title").Length > 0)
+        {
+            rep.Add("认证：" + S(official, "title"));
+        }
+        return string.Join("\n", rep);
+    }
+
+    // ---- BiliUpdates 官方实现：动态接口（视频投稿，无需WBI） ----
+    async Task<string> OfficialBiliUpdatesAsync(long uid)
+    {
+        JsonElement data = await BiliOfficialGetAsync(BiliApiBase + "/x/polymer/web-dynamic/v1/feed/space?host_mid="
+            + uid.ToString(CultureInfo.InvariantCulture));
+        var rep = new List<string>();
+        if (data.ValueKind == JsonValueKind.Object && data.TryGetProperty("items", out JsonElement items) && items.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement item in items.EnumerateArray())
+            {
+                if (GetStringField(item, "type") != "DYNAMIC_TYPE_AV")
+                {
+                    continue;
+                }
+                string authorName = "";
+                long pubTs = 0;
+                string title = "";
+                string bvid = "";
+                if (item.TryGetProperty("modules", out JsonElement modules) && modules.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (JsonElement module in modules.EnumerateArray())
+                    {
+                        if (module.TryGetProperty("module_author", out JsonElement author) && author.ValueKind == JsonValueKind.Object)
+                        {
+                            authorName = S(author, "name");
+                            pubTs = GetNumericField(author, "pub_ts");
+                        }
+                        if (module.TryGetProperty("module_dynamic", out JsonElement dynamicModule)
+                            && dynamicModule.ValueKind == JsonValueKind.Object
+                            && dynamicModule.TryGetProperty("major", out JsonElement major)
+                            && major.ValueKind == JsonValueKind.Object
+                            && major.TryGetProperty("archive", out JsonElement archive)
+                            && archive.ValueKind == JsonValueKind.Object)
+                        {
+                            title = S(archive, "title");
+                            bvid = S(archive, "bvid");
+                        }
+                    }
+                }
+                if (bvid.Length == 0)
+                {
+                    continue;
+                }
+                string timeText = pubTs > 0
+                    ? DateTimeOffset.FromUnixTimeSeconds(pubTs).LocalDateTime.ToString("MM-dd HH:mm", CultureInfo.InvariantCulture) + " "
+                    : "";
+                rep.Add(timeText + title + "（" + bvid + "）" + (authorName.Length > 0 ? " - " + authorName : ""));
+            }
+        }
+        if (rep.Count == 0)
+        {
+            rep.Add("没有取到视频投稿（官方容灾仅支持视频投稿；动态/专栏请等第三方恢复后查询）");
+        }
+        return string.Join("\n", rep);
+    }
+
+    // ---- BiliHot 官方实现：popular 热门榜 + archive/related 相关推荐 ----
+    async Task<string> OfficialBiliHotAsync(string? action, string? bvid, int? pn)
+    {
+        string normalized = (action ?? "popular").Trim().ToLowerInvariant();
+        List<JsonElement> entries = new();
+        if (normalized == "related")
+        {
+            if (string.IsNullOrWhiteSpace(bvid))
+            {
+                throw new Exception("相关推荐需要传 bvid");
+            }
+            JsonElement data = await BiliOfficialGetAsync(BiliApiBase + "/x/web-interface/archive/related?bvid="
+                + Uri.EscapeDataString(bvid));
+            if (data.ValueKind == JsonValueKind.Array)
+            {
+                entries = data.EnumerateArray().Take(10).Select(item => item.Clone()).ToList();
+            }
+        }
+        else
+        {
+            JsonElement data = await BiliOfficialGetAsync(BiliApiBase + "/x/web-interface/popular?ps=20&pn="
+                + Math.Max(1, pn ?? 1).ToString(CultureInfo.InvariantCulture));
+            if (data.ValueKind == JsonValueKind.Object && data.TryGetProperty("list", out JsonElement list) && list.ValueKind == JsonValueKind.Array)
+            {
+                entries = list.EnumerateArray().Take(10).Select(item => item.Clone()).ToList();
+            }
+        }
+        var rep = new List<string>();
+        int index = 0;
+        foreach (JsonElement item in entries)
+        {
+            index++;
+            string upName = item.TryGetProperty("owner", out JsonElement owner) && owner.ValueKind == JsonValueKind.Object
+                ? S(owner, "name")
+                : "";
+            rep.Add(index + ". " + S(item, "bvid") + " - " + S(item, "title") + (upName.Length > 0 ? " - " + upName : ""));
+        }
+        if (rep.Count == 0)
+        {
+            rep.Add("没有内容");
+        }
+        return string.Join("\n", rep);
+    }
+
+    // ---- BiliQrLogin 官方实现：passport 扫码登录（官方网页原生接口） ----
+    async Task<string> OfficialBiliQrLoginAsync(string action, string? qrcodeKey)
+    {
+        string normalized = (action ?? "").Trim().ToLowerInvariant();
+        if (normalized == "generate")
+        {
+            JsonElement data = await BiliOfficialGetAsync("https://passport.bilibili.com/x/passport-login/web/qrcode/generate");
+            return "qrcode_key " + S(data, "qrcode_key") + "\n二维码链接（180秒内有效，打开后扫码）：\n" + S(data, "qrcode_url")
+                + "\n扫完后用 action=poll、qrcode_key 查结果；登录成功后 Cookie 自动存本地";
+        }
+        if (normalized == "poll")
+        {
+            if (string.IsNullOrWhiteSpace(qrcodeKey))
+            {
+                throw new Exception("poll 需要 qrcode_key");
+            }
+            using HttpRequestMessage request = new(HttpMethod.Get,
+                "https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=" + Uri.EscapeDataString(qrcodeKey));
+            using HttpResponseMessage response = await http.SendAsync(request);
+            string body = await response.Content.ReadAsStringAsync();
+            using JsonDocument parsed = JsonDocument.Parse(body);
+            JsonElement data = parsed.RootElement.GetProperty("data").Clone();
+            long innerCode = GetNumericField(data, "code");
+            if (innerCode == 0)
+            {
+                List<string> cookies = new();
+                if (response.Headers.TryGetValues("Set-Cookie", out IEnumerable<string>? setCookieHeaders))
+                {
+                    foreach (string cookieHeader in setCookieHeaders)
+                    {
+                        cookies.Add(cookieHeader.Split(';')[0].Trim());
+                    }
+                }
+                string cookie = string.Join("; ", cookies);
+                if (cookie.Length > 0)
+                {
+                    SaveBiliCookie(cookie);
+                }
+                return "登录成功，Cookie 已保存到本地（官方接口将自动携带）。可用 BiliCookie check 验证。";
+            }
+            if (innerCode == 86090)
+            {
+                return "已扫描，等待确认";
+            }
+            if (innerCode == 86038)
+            {
+                return "二维码已过期，请重新 generate";
+            }
+            if (innerCode == 86101)
+            {
+                return "未扫描";
+            }
+            return S(data, "message").Length > 0 ? S(data, "message") : "状态码 " + innerCode;
+        }
+        throw new Exception("action 仅支持 generate/poll");
+    }
+
+    // ---- BiliCookie 官方实现：本地Cookie管理 ----
+    async Task<string> OfficialBiliCookieAsync(string? action, string? cookieString)
+    {
+        string normalized = (action ?? "list").Trim().ToLowerInvariant();
+        string path = BiliCookieFilePath();
+        switch (normalized)
+        {
+            case "list":
+            {
+                string cookie = LoadBiliCookie();
+                return cookie.Length == 0
+                    ? "本地未保存B站Cookie（可用 BiliQrLogin 扫码生成，或 BiliCookie save 导入）"
+                    : "本地Cookie存在（" + cookie.Length + " 字符，不回显内容），保存于 " + path;
+            }
+            case "check":
+            {
+                string cookie = LoadBiliCookie();
+                if (cookie.Length == 0)
+                {
+                    return "本地未保存B站Cookie";
+                }
+                try
+                {
+                    JsonElement nav = await BiliOfficialGetAsync(BiliApiBase + "/x/web-interface/nav");
+                    bool isLogin = nav.TryGetProperty("isLogin", out JsonElement loginElement) && loginElement.ValueKind == JsonValueKind.True;
+                    string uname = S(nav, "uname");
+                    return isLogin ? "本地Cookie登录态有效：" + uname : "本地Cookie已失效，请重新扫码登录";
+                }
+                catch (Exception checkError)
+                {
+                    return "Cookie有效性验证失败：" + checkError.Message;
+                }
+            }
+            case "delete":
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+                return "本地Cookie已删除";
+            case "save":
+                if (string.IsNullOrWhiteSpace(cookieString))
+                {
+                    throw new Exception("save 需要提供 cookieString");
+                }
+                SaveBiliCookie(cookieString);
+                return "Cookie已保存到本地";
+            default:
+                return "不支持的action：" + normalized + "（可用 list/check/delete/save）";
+        }
+    }
+
+    // ---- 搜索官方容灾：平台公开接口 ----
+    async Task<List<(string Id, string Name, string Singer)>> OfficialSearchAsync(string platform, string keyword)
+    {
+        List<(string, string, string)> results = new();
+        if (platform == "163")
+        {
+            using HttpRequestMessage request = new(HttpMethod.Post, "https://music.163.com/api/search/get");
+            request.Headers.Referrer = new Uri("https://music.163.com/");
+            request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
+            request.Content = new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["s"] = keyword,
+                ["type"] = "1",
+                ["limit"] = "5"
+            });
+            string body = await (await http.SendAsync(request)).Content.ReadAsStringAsync();
+            using JsonDocument doc = JsonDocument.Parse(body);
+            JsonElement songs = doc.RootElement.GetProperty("result").GetProperty("songs").Clone();
+            foreach (JsonElement song in songs.EnumerateArray())
+            {
+                string singer = "";
+                if (song.TryGetProperty("artists", out JsonElement artists) && artists.ValueKind == JsonValueKind.Array && artists.GetArrayLength() > 0)
+                {
+                    singer = artists[0].GetProperty("name").GetString() ?? "";
+                }
+                results.Add((GetNumericField(song, "id").ToString(CultureInfo.InvariantCulture), GetStringField(song, "name"), singer));
+            }
+        }
+        else if (platform == "qq")
+        {
+            using HttpRequestMessage request = new(HttpMethod.Get,
+                "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg?format=json&key=" + Uri.EscapeDataString(keyword));
+            request.Headers.Referrer = new Uri("https://y.qq.com/");
+            request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
+            string body = await (await http.SendAsync(request)).Content.ReadAsStringAsync();
+            using JsonDocument doc = JsonDocument.Parse(body);
+            JsonElement items = doc.RootElement.GetProperty("data").GetProperty("song").GetProperty("itemlist").Clone();
+            foreach (JsonElement item in items.EnumerateArray())
+            {
+                results.Add((GetStringField(item, "songmid"), GetStringField(item, "songname"), GetStringField(item, "singer")));
+            }
+        }
+        else if (platform == "kugou")
+        {
+            using HttpRequestMessage request = new(HttpMethod.Get,
+                "https://mobilecdn.kugou.com/api/v3/search/song?format=json&pagesize=5&page=1&keyword=" + Uri.EscapeDataString(keyword));
+            request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
+            string body = await (await http.SendAsync(request)).Content.ReadAsStringAsync();
+            using JsonDocument doc = JsonDocument.Parse(body);
+            JsonElement infoList = doc.RootElement.GetProperty("data").GetProperty("info").Clone();
+            foreach (JsonElement item in infoList.EnumerateArray())
+            {
+                results.Add((GetStringField(item, "hash"), GetStringField(item, "songname"), GetStringField(item, "singername")));
+            }
+        }
+        else
+        {
+            throw new Exception("官方搜索不支持该平台：" + platform);
+        }
+        return results;
+    }
+
+    // ---- 音乐卡官方容灾：构造 OneBot 标准音乐消息段 ----
+    async Task<JsonObject> BuildOfficialMusicSegmentAsync(string platform, string id, string? title)
+    {
+        string normalized = (platform ?? "163").Trim().ToLowerInvariant();
+        if (normalized == "netease")
+        {
+            normalized = "163";
+        }
+        if (normalized == "163" || normalized == "qq")
+        {
+            // 官方模板类型：协议端自己生成卡片
+            string songKey = id.Trim();
+            bool idValid = normalized == "163" ? songKey.All(char.IsDigit) : songKey.Length == 14;
+            if (idValid == false)
+            {
+                List<(string Id, string Name, string Singer)> hits = await OfficialSearchAsync(normalized, id);
+                if (hits.Count == 0)
+                {
+                    throw new Exception("官方搜索没找到歌曲：" + id);
+                }
+                songKey = hits[0].Id;
+            }
+            return new JsonObject
+            {
+                ["type"] = "music",
+                ["data"] = new JsonObject
+                {
+                    ["type"] = normalized,
+                    ["id"] = songKey
+                }
+            };
+        }
+
+        // bilibili / kugou：custom 音乐段（官方无模板类型）
+        Dictionary<string, string> info = await ResolveInfoAsync(normalized, id, title);
+        string audio = "";
+        if (normalized == "bilibili")
+        {
+            try
+            {
+                Match bvidMatch = Regex.Match(info.GetValueOrDefault("jump") ?? "", "BV[0-9A-Za-z]{10}");
+                if (bvidMatch.Success)
+                {
+                    JsonElement view = await BiliOfficialGetAsync(BiliApiBase + "/x/web-interface/view?bvid=" + bvidMatch.Value);
+                    long cid = GetNumericField(view, "cid");
+                    JsonElement play = await BiliOfficialGetAsync(BiliApiBase + "/x/player/playurl?bvid=" + bvidMatch.Value
+                        + "&cid=" + cid + "&qn=64&fnval=16");
+                    if (play.TryGetProperty("dash", out JsonElement dash)
+                        && dash.TryGetProperty("audio", out JsonElement dashAudio)
+                        && dashAudio.ValueKind == JsonValueKind.Array && dashAudio.GetArrayLength() > 0)
+                    {
+                        audio = dashAudio[0].TryGetProperty("base_url", out JsonElement audioUrl) ? audioUrl.GetString() ?? "" : "";
+                    }
+                    else if (play.TryGetProperty("durl", out JsonElement playDurl) && playDurl.ValueKind == JsonValueKind.Array && playDurl.GetArrayLength() > 0)
+                    {
+                        audio = playDurl[0].TryGetProperty("url", out JsonElement playUrl) ? playUrl.GetString() ?? "" : "";
+                    }
+                }
+            }
+            catch
+            {
+                // 直链失败则降级为不可播放卡片
+            }
+        }
+        else
+        {
+            // kugou 官方无公开直链：降级为跳转卡（audio 指向页面）
+            audio = info.GetValueOrDefault("url") ?? "";
+        }
+        return new JsonObject
+        {
+            ["type"] = "music",
+            ["data"] = new JsonObject
+            {
+                ["type"] = "custom",
+                ["url"] = info.GetValueOrDefault("jump") ?? "",
+                ["audio"] = audio,
+                ["title"] = info.GetValueOrDefault("song") ?? "未知",
+                ["content"] = info.GetValueOrDefault("singer") ?? "",
+                ["image"] = info.GetValueOrDefault("cover") ?? ""
+            }
+        };
+    }
+
+    static string FormatSeconds(long totalSeconds)
+    {
+        if (totalSeconds <= 0)
+        {
+            return "N/A";
+        }
+        return (totalSeconds / 60).ToString(CultureInfo.InvariantCulture) + ":"
+            + (totalSeconds % 60).ToString("00", CultureInfo.InvariantCulture);
     }
 
     class PageMeta { public string title = ""; public string desc = ""; public string image = ""; }
@@ -1071,6 +1767,18 @@ public class ShareArkModule(
 
     async Task<bool> SendJsonAsync(long target, bool isGroup, string cardJson)
     {
+        JsonObject jsonSegment = new()
+        {
+            ["type"] = "json",
+            ["data"] = new JsonObject { ["data"] = cardJson }
+        };
+        JsonArray segments = new();
+        segments.Add(jsonSegment);
+        return await SendSegmentsAsync(target, isGroup, segments);
+    }
+
+    async Task<bool> SendSegmentsAsync(long target, bool isGroup, JsonArray segments)
+    {
         await _wsLock.WaitAsync();
         try
         {
@@ -1089,25 +1797,18 @@ public class ShareArkModule(
                     string echo = Guid.NewGuid().ToString();
                     string action = isGroup ? "send_group_msg" : "send_private_msg";
                     string idKey = isGroup ? "group_id" : "user_id";
-                    var payload = new Dictionary<string, object>
+                    JsonObject payload = new()
                     {
                         ["action"] = action,
-                        ["params"] = new Dictionary<string, object>
+                        ["params"] = new JsonObject
                         {
                             [idKey] = target,
-                            ["message"] = new List<object>
-                            {
-                                new Dictionary<string, object>
-                                {
-                                    ["type"] = "json",
-                                    ["data"] = new Dictionary<string, object> { ["data"] = cardJson }
-                                }
-                            }
+                            ["message"] = segments.DeepClone()
                         },
                         ["echo"] = echo
                     };
 
-                    string payloadText = JsonSerializer.Serialize(payload);
+                    string payloadText = payload.ToJsonString();
                     using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
                     await _sharedWs.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(payloadText)), WebSocketMessageType.Text, true, cts.Token);
 
