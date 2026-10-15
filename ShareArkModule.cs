@@ -541,37 +541,48 @@ public class ShareArkModule(
             throw new Exception("没给目标，发群里还是私聊得说一个");
         long target = targetId.Value;
         bool isGroup = !string.Equals(type, "private", StringComparison.OrdinalIgnoreCase);
+        string thirdPartyError;
         try
         {
             await EnsureFit();
             string card = await SignAsync(platform, id, title);
-            bool ok = await SendJsonAsync(target, isGroup, card);
-            if (ok) interactor.Poke("卡片已发出"); else interactor.Poke("卡片没发出去");
-            return;
+            (bool Success, string Message) sent = await SendJsonAsync(target, isGroup, card);
+            if (sent.Success)
+            {
+                interactor.Poke("卡片已发出");
+                return;
+            }
+            thirdPartyError = sent.Message;
         }
         catch (Exception signError)
         {
-            if (Configuration.EnableOfficialFallback == false)
+            thirdPartyError = signError.Message;
+        }
+
+        if (Configuration.EnableOfficialFallback == false)
+        {
+            logger.LogWarning("发卡片失败：" + thirdPartyError);
+            interactor.Poke("❌ 发卡片失败：" + thirdPartyError);
+            return;
+        }
+        // 签名成功但协议端不吃 json 卡片时，退到 OneBot 标准音乐段
+        try
+        {
+            JsonObject musicSegment = await BuildOfficialMusicSegmentAsync(platform, id, title);
+            JsonArray segments = new();
+            segments.Add(musicSegment);
+            (bool Success, string Message) official = await SendSegmentsAsync(target, isGroup, segments);
+            if (official.Success)
             {
-                logger.LogWarning("发卡片失败：" + signError.Message);
-                interactor.Poke("发卡片失败：" + signError.Message);
+                interactor.Poke("✅ 卡片已发出（OneBot 标准音乐段容灾；json 卡片那步失败：" + thirdPartyError + "）");
                 return;
             }
-            // 官方容灾：改用 OneBot 标准音乐段（163/qq 官方模板，kugou/bilibili custom）
-            try
-            {
-                JsonObject musicSegment = await BuildOfficialMusicSegmentAsync(platform, id, title);
-                JsonArray segments = new();
-                segments.Add(musicSegment);
-                bool ok = await SendSegmentsAsync(target, isGroup, segments);
-                if (ok) interactor.Poke("✅ 卡片已发出（第三方签名失败，官方音乐段容灾）");
-                else interactor.Poke("卡片没发出去（官方容灾）");
-            }
-            catch (Exception officialError)
-            {
-                logger.LogWarning("发卡片失败：第三方 {Third}；官方容灾 {Official}", signError.Message, officialError.Message);
-                interactor.Poke("❌ 发卡片：第三方（" + signError.Message + "）；官方容灾（" + officialError.Message + "）");
-            }
+            interactor.Poke("❌ 发卡片失败：json 卡片（" + thirdPartyError + "）；官方音乐段（" + official.Message + "）");
+        }
+        catch (Exception officialError)
+        {
+            logger.LogWarning("发卡片失败：第三方 {Third}；官方容灾 {Official}", thirdPartyError, officialError.Message);
+            interactor.Poke("❌ 发卡片：第三方（" + thirdPartyError + "）；官方容灾（" + officialError.Message + "）");
         }
     }
 
@@ -626,8 +637,9 @@ public class ShareArkModule(
             if (doc.RootElement.GetProperty("code").GetInt32() != 200)
                 throw new Exception("签名失败：" + doc.RootElement.GetProperty("msg").GetString() + " | 请求=" + MaskKey(full));
             string card = doc.RootElement.GetProperty("data").GetRawText();
-            bool ok = await SendJsonAsync(target, isGroup, card);
-            if (ok) interactor.Poke("分享卡已发出"); else interactor.Poke("分享卡没发出去");
+            (bool Success, string Message) sent = await SendJsonAsync(target, isGroup, card);
+            if (sent.Success) interactor.Poke("分享卡已发出");
+            else interactor.Poke("❌ 分享卡没发出去：" + sent.Message);
         }
         catch (Exception ex)
         {
@@ -1306,7 +1318,8 @@ public class ShareArkModule(
         if (normalized == "generate")
         {
             JsonElement data = await BiliOfficialGetAsync("https://passport.bilibili.com/x/passport-login/web/qrcode/generate");
-            return "qrcode_key " + S(data, "qrcode_key") + "\n二维码链接（180秒内有效，打开后扫码）：\n" + S(data, "qrcode_url")
+            // passport 这里回的字段是 url（实测 data 只有 url 与 qrcode_key），写成 qrcode_url 会打出空链接
+            return "qrcode_key " + S(data, "qrcode_key") + "\n二维码链接（180秒内有效，打开后扫码）：\n" + S(data, "url")
                 + "\n扫完后用 action=poll、qrcode_key 查结果；登录成功后 Cookie 自动存本地";
         }
         if (normalized == "poll")
@@ -1332,11 +1345,21 @@ public class ShareArkModule(
                         cookies.Add(cookieHeader.Split(';')[0].Trim());
                     }
                 }
-                string cookie = string.Join("; ", cookies);
-                if (cookie.Length > 0)
+                // 成功时 Cookie 也可能只拼在 data.url 的查询串里，两种下发形态都收，
+                // 只认一种就会出现「说登录成功了，其实本地存了个空 Cookie」
+                foreach (string urlPair in LoginCookiePairsFromUrl(S(data, "url")))
                 {
-                    SaveBiliCookie(cookie);
+                    if (cookies.Contains(urlPair) == false)
+                    {
+                        cookies.Add(urlPair);
+                    }
                 }
+                if (cookies.Count == 0)
+                {
+                    return "B站回扫码成功，但响应里既没有 Set-Cookie 也没带 Cookie 的跳转链接，Cookie 没有保存。"
+                        + "把这行发给开发者，用来定位是接口改了哪个字段";
+                }
+                SaveBiliCookie(string.Join("; ", cookies));
                 return "登录成功，Cookie 已保存到本地（官方接口将自动携带）。可用 BiliCookie check 验证。";
             }
             if (innerCode == 86090)
@@ -1354,6 +1377,27 @@ public class ShareArkModule(
             return S(data, "message").Length > 0 ? S(data, "message") : "状态码 " + innerCode;
         }
         throw new Exception("action 仅支持 generate/poll");
+    }
+
+    // 扫码成功时 B 站也可能把 Cookie 拼在 data.url 的查询串里下发，只取登录相关这几对
+    static List<string> LoginCookiePairsFromUrl(string url)
+    {
+        List<string> pairs = new();
+        int mark = url.IndexOf('?');
+        if (mark < 0)
+        {
+            return pairs;
+        }
+        foreach (string item in url[(mark + 1)..].Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            string[] parts = item.Split('=', 2);
+            if (parts.Length == 2
+                && parts[0] is "SESSDATA" or "bili_jct" or "DedeUserID" or "DedeUserID__ckMd5" or "sid")
+            {
+                pairs.Add(parts[0] + "=" + Uri.UnescapeDataString(parts[1]));
+            }
+        }
+        return pairs;
     }
 
     // ---- BiliCookie 官方实现：本地Cookie管理 ----
@@ -1538,13 +1582,20 @@ public class ShareArkModule(
             // kugou 官方无公开直链：降级为跳转卡（audio 指向页面）
             audio = info.GetValueOrDefault("url") ?? "";
         }
+        // SnowLuma 校验 custom 音乐段必须有非空 url/audio/title，拿不到播放直链时退回跳转地址，
+        // 否则整条消息会被 1400 原子拒绝（NapCat 与 LLOneBot 容忍空 audio）
+        string jumpUrl = info.GetValueOrDefault("jump") ?? "";
+        if (audio.Length == 0)
+        {
+            audio = jumpUrl;
+        }
         return new JsonObject
         {
             ["type"] = "music",
             ["data"] = new JsonObject
             {
                 ["type"] = "custom",
-                ["url"] = info.GetValueOrDefault("jump") ?? "",
+                ["url"] = jumpUrl,
                 ["audio"] = audio,
                 ["title"] = info.GetValueOrDefault("song") ?? "未知",
                 ["content"] = info.GetValueOrDefault("singer") ?? "",
@@ -1800,8 +1851,10 @@ public class ShareArkModule(
 
     private static ClientWebSocket? _sharedWs;
     private static readonly SemaphoreSlim _wsLock = new(1, 1);
+    static string providerName = "";
+    static bool providerResolved;
 
-    async Task<bool> SendJsonAsync(long target, bool isGroup, string cardJson)
+    async Task<(bool Success, string Message)> SendJsonAsync(long target, bool isGroup, string cardJson)
     {
         JsonObject jsonSegment = new()
         {
@@ -1813,88 +1866,155 @@ public class ShareArkModule(
         return await SendSegmentsAsync(target, isGroup, segments);
     }
 
-    async Task<bool> SendSegmentsAsync(long target, bool isGroup, JsonArray segments)
+    string ProviderLabel() => providerName.Length > 0 ? providerName : "协议端";
+
+    // 三端都回 app_name（NapCat.Onebot / LLOneBot / SnowLuma），报错风格不同所以失败信息要带署名
+    async Task ResolveProviderAsync()
+    {
+        if (providerResolved)
+        {
+            return;
+        }
+        providerResolved = true;
+        try
+        {
+            (int retcode, string message, JsonElement data) = await SendActionAsync("get_version_info", new JsonObject());
+            if (retcode != 0)
+            {
+                throw new Exception(message);
+            }
+            providerName = (GetStringField(data, "app_name") + " " + GetStringField(data, "name")
+                + " " + GetStringField(data, "vendor")).Trim();
+            logger.LogInformation("[ShareArk] 协议端：{Provider} {Version}",
+                providerName.Length > 0 ? providerName : "未识别", GetStringField(data, "app_version"));
+        }
+        catch (Exception versionError)
+        {
+            logger.LogInformation("[ShareArk] 未能识别协议端：{Message}", versionError.Message);
+        }
+    }
+
+    // 发一段消息。三端对不认识的消息段处理方式完全不同：
+    // NapCat 抛"未知的消息类型"回 1200、SnowLuma 整条原子拒绝回 1400、
+    // LLOneBot 直接丢掉该段但照发其余内容并回 retcode 0——所以成功也必须验 message_id。
+    async Task<(bool Success, string Message)> SendSegmentsAsync(long target, bool isGroup, JsonArray segments)
+    {
+        await ResolveProviderAsync();
+        string action = isGroup ? "send_group_msg" : "send_private_msg";
+        string idKey = isGroup ? "group_id" : "user_id";
+        JsonObject parameters = new()
+        {
+            [idKey] = target,
+            ["message"] = segments
+        };
+        try
+        {
+            (int retcode, string message, JsonElement data) = await SendActionAsync(action, parameters);
+            if (retcode != 0)
+            {
+                return (false, ProviderLabel() + " 返回 " + retcode + "：" + message + FailureHint(retcode));
+            }
+            // 三端成功都会带 message_id；回成功却没有它，说明这一段被静默丢弃了
+            if (data.ValueKind != JsonValueKind.Object || data.TryGetProperty("message_id", out _) == false)
+            {
+                return (false, ProviderLabel() + " 回成功但没给 message_id，卡片段很可能被静默丢弃"
+                    + "（LLOneBot 对不认识的消息段不报错直接丢；音乐卡片还需在 LLOneBot 里配置签名地址）");
+            }
+            return (true, "");
+        }
+        catch (Exception sendError)
+        {
+            return (false, sendError.Message);
+        }
+    }
+
+    string FailureHint(int retcode) => retcode switch
+    {
+        1404 => "（" + ProviderLabel() + " 未实现该接口）",
+        // 1400=SnowLuma 的 UNKNOWN_TYPE/BAD_REQUEST，1200=NapCat 的未知消息类型：都是整条被拒
+        1400 or 1200 => "（" + ProviderLabel() + " 不认识这个消息段类型，整条消息已退回；卡片段用 json 三端都认）",
+        _ => ""
+    };
+
+    async Task<(int Retcode, string Message, JsonElement Data)> SendActionAsync(string action, JsonObject parameters)
     {
         await _wsLock.WaitAsync();
         try
         {
+            Exception? lastError = null;
             for (int attempt = 0; attempt < 2; attempt++)
             {
                 try
                 {
-                    if (_sharedWs == null || _sharedWs.State != WebSocketState.Open)
-                    {
-                        _sharedWs?.Dispose();
-                        _sharedWs = new ClientWebSocket();
-                        using var cts0 = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-                        await _sharedWs.ConnectAsync(new Uri(Configuration.WsUrl), cts0.Token);
-                    }
-
-                    string echo = Guid.NewGuid().ToString();
-                    string action = isGroup ? "send_group_msg" : "send_private_msg";
-                    string idKey = isGroup ? "group_id" : "user_id";
-                    JsonObject payload = new()
-                    {
-                        ["action"] = action,
-                        ["params"] = new JsonObject
-                        {
-                            [idKey] = target,
-                            ["message"] = segments.DeepClone()
-                        },
-                        ["echo"] = echo
-                    };
-
-                    string payloadText = payload.ToJsonString();
-                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                    await _sharedWs.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(payloadText)), WebSocketMessageType.Text, true, cts.Token);
-
-                    byte[] recvBuf = new byte[64 * 1024];
-                    while (!cts.IsCancellationRequested)
-                    {
-                        var ms = new MemoryStream();
-                        WebSocketReceiveResult r;
-                        do
-                        {
-                            r = await _sharedWs.ReceiveAsync(new ArraySegment<byte>(recvBuf), cts.Token);
-                            if (r.MessageType == WebSocketMessageType.Close)
-                            {
-                                _sharedWs.Dispose();
-                                _sharedWs = null;
-                                return false;
-                            }
-                            ms.Write(recvBuf, 0, r.Count);
-                        } while (!r.EndOfMessage);
-
-                        string text = Encoding.UTF8.GetString(ms.ToArray());
-                        try
-                        {
-                            using var doc = JsonDocument.Parse(text);
-                            if (!doc.RootElement.TryGetProperty("echo", out var e) || e.GetString() != echo) continue;
-                            int ret = doc.RootElement.TryGetProperty("retcode", out var rc) ? rc.GetInt32() : -1;
-                            if (ret != 0) logger.LogWarning("协议端返回 " + ret);
-                            return ret == 0;
-                        }
-                        catch { }
-                    }
-                    return false;
+                    return await SendActionOnceAsync(action, parameters);
                 }
-                catch (Exception ex)
+                catch (Exception attemptError)
                 {
+                    lastError = attemptError;
                     _sharedWs?.Dispose();
                     _sharedWs = null;
-                    if (attempt == 1)
-                    {
-                        logger.LogWarning("发卡片失败：" + ex.Message);
-                        return false;
-                    }
                 }
             }
-            return false;
+            throw new Exception(action + " 失败：" + lastError!.Message);
         }
         finally
         {
             _wsLock.Release();
         }
+    }
+
+    async Task<(int Retcode, string Message, JsonElement Data)> SendActionOnceAsync(string action, JsonObject parameters)
+    {
+        if (_sharedWs == null || _sharedWs.State != WebSocketState.Open)
+        {
+            _sharedWs?.Dispose();
+            ClientWebSocket connection = new();
+            using CancellationTokenSource connectTimeout = new(TimeSpan.FromSeconds(10));
+            await connection.ConnectAsync(new Uri(Configuration.WsUrl), connectTimeout.Token);
+            _sharedWs = connection;
+        }
+
+        string echo = Guid.NewGuid().ToString();
+        JsonObject payload = new()
+        {
+            ["action"] = action,
+            ["params"] = parameters,
+            ["echo"] = echo
+        };
+        byte[] recvBuf = new byte[64 * 1024];
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(15));
+        await _sharedWs.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(payload.ToJsonString())),
+            WebSocketMessageType.Text, true, cts.Token);
+
+        while (cts.IsCancellationRequested == false)
+        {
+            MemoryStream buffer = new();
+            WebSocketReceiveResult received;
+            do
+            {
+                received = await _sharedWs.ReceiveAsync(new ArraySegment<byte>(recvBuf), cts.Token);
+                if (received.MessageType == WebSocketMessageType.Close)
+                {
+                    throw new Exception("协议端关闭了连接");
+                }
+                buffer.Write(recvBuf, 0, received.Count);
+            } while (received.EndOfMessage == false);
+
+            using JsonDocument doc = JsonDocument.Parse(Encoding.UTF8.GetString(buffer.ToArray()));
+            // 事件推送与别的响应都会路过，只认自己 echo 的那一条
+            if (doc.RootElement.TryGetProperty("echo", out JsonElement echoElement) == false
+                || echoElement.GetString() != echo)
+            {
+                continue;
+            }
+            int retcode = doc.RootElement.TryGetProperty("retcode", out JsonElement retcodeElement)
+                && retcodeElement.ValueKind == JsonValueKind.Number ? retcodeElement.GetInt32() : -1;
+            string message = GetStringField(doc.RootElement, "message");
+            JsonElement data = doc.RootElement.TryGetProperty("data", out JsonElement dataElement)
+                ? dataElement.Clone() : JsonDocument.Parse("null").RootElement.Clone();
+            return (retcode, message, data);
+        }
+        throw new Exception("等协议端响应超时");
     }
 
     protected override Task OnAwake()
@@ -1912,7 +2032,7 @@ public class ShareArkModule(
     {
         // 销毁/热重载时断开协议端连接、清掉探测缓存，避免连接泄漏
         await _wsLock.WaitAsync();
-        try { _sharedWs?.Dispose(); _sharedWs = null; _sfx.Clear(); _discovered = false; }
+        try { _sharedWs?.Dispose(); _sharedWs = null; _sfx.Clear(); _discovered = false; providerName = ""; providerResolved = false; }
         finally { _wsLock.Release(); }
     }
 }
