@@ -4,7 +4,7 @@
 QQ 分享卡片插件（音乐卡 + 通用链接卡），签名由插件自己完成，直塞协议端 ws，不依赖协议端自带的签名地址配置。
 
 ## 版本
-4.7.0
+4.7.1
 
 ## 官方容灾（4.1.0 新增）
 配置开关「容灾·启用官方接口回退」（默认开）：第三方接口调用失败时**自动切换官方公开接口**，双失败才报错（附双方原因）。
@@ -78,10 +78,10 @@ QQ 分享卡片插件（音乐卡 + 通用链接卡），签名由插件自己�
 ## 三端兼容（NapCat / LLOneBot / SnowLuma）
 三端对消息段的处理完全不同，卡片"发成功却看不见"就是这么来的，现已逐端核对源码处理：
 - 首次发卡前用 `get_version_info` 识别协议端（三端都回 `app_name`：`NapCat.Onebot` / `LLOneBot` / `SnowLuma`），失败原因都带上协议端署名
-- **未知消息段**：NapCat 抛「未知的消息类型」回 retcode 1200；SnowLuma 原子拒绝整条消息回 1400；LLOneBot **不报错、直接丢掉该段并回 retcode 0**。因此成功也校验返回里必须有 `message_id`，没有就报「卡片段很可能被静默丢弃」而不是谎报成功
+- **未知消息段**：NapCat 抛「未知的消息类型」回 retcode 1200；SnowLuma 原子拒绝整条消息回 1400（`MessageElementValidationError(UNKNOWN_TYPE)`）；LLOneBot 本机 7.12.14 实测也回 **1200 并整条原子退回**（`消息体无法解析，请检查是否发送了不支持的消息类型`，早先按源码 switch 无 default 推断的「丢掉该段、其余照发、retcode 仍 0」已被实测推翻）。因此成功也校验返回里必须有 `message_id`，没有就报「卡片段很可能被静默丢弃」而不是谎报成功
 - 卡片段统一用 `json`（`data.data` 放卡片 JSON 字符串）：三端都认这种写法，NapCat 会自动 stringify、SnowLuma 要求 data 是对象或非空 JSON 字符串
-- 容灾音乐段 `music`：平台卡（163/qq）三端都要求 `id`，但 LLOneBot 还需要在它自己的设置里配「音乐卡片签名地址」，未配时返回的错误信息现在会原样报出来；custom 卡补上 SnowLuma 的校验要求（`url`/`audio`/`title` 必须非空，拿不到播放直链时回落跳转地址，否则整条消息被 1400 退回）
-- retcode 1404 报「该协议端未实现此接口」
+- 容灾音乐段 `music`：平台卡（163/qq）三端都要求 `id`，但 LLOneBot 还需要在它自己的设置里配「音乐卡片签名地址」，未配时返回的错误信息现在会原样报出来；custom 卡补上 SnowLuma 的校验要求（`url`/`audio`/`title` 必须非空，拿不到播放直链时回落跳转地址，否则整条消息被 1400 退回）；SnowLuma 平台卡的签名走它配置里的 `musicSignUrl`（默认 `ss.xingzhige.com`），拿不到就退化成 structmsg 卡
+- retcode 1404 报「该协议端未实现此接口」；失败原因同时读 `message` 与 `wording`——SnowLuma 的失败包只填 `wording`，只读 `message` 会让它所有报错都显示成空
 - 发送层重构成通用动作调用（连接复用 + echo 配对 + 断线重连一次），`get_version_info` 与发卡走同一条通道
 
 ## 自动搜 ID

@@ -508,7 +508,8 @@ public class ShareArkModule(
                 {
                     throw;
                 }
-                // 容灾：第三方失败转B站官方搜索
+                // 容灾：第三方失败转B站官方搜索，失败原因得留个痕，不然排查时两头都查不到
+                logger.LogWarning("B站第三方搜索失败，转官方搜索：" + thirdPartyError.Message);
             }
         }
         string ou = "https://api.bilibili.com/x/web-interface/search/all/v2?keyword=" + Uri.EscapeDataString(keyword);
@@ -2010,6 +2011,11 @@ public class ShareArkModule(
             int retcode = doc.RootElement.TryGetProperty("retcode", out JsonElement retcodeElement)
                 && retcodeElement.ValueKind == JsonValueKind.Number ? retcodeElement.GetInt32() : -1;
             string message = GetStringField(doc.RootElement, "message");
+            // SnowLuma 的失败包只填 wording，LLOneBot/NapCat 两个键都填
+            if (message.Length == 0)
+            {
+                message = GetStringField(doc.RootElement, "wording");
+            }
             JsonElement data = doc.RootElement.TryGetProperty("data", out JsonElement dataElement)
                 ? dataElement.Clone() : JsonDocument.Parse("null").RootElement.Clone();
             return (retcode, message, data);
