@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
@@ -83,13 +84,19 @@ public class ShareArkConfig
     public bool EnableProbeBase { get; set; } = true;
     [DisplayName("开关·列出全部接口")] [Description("关闭后 ProbeAll 不可用")]
     public bool EnableProbeAll { get; set; } = true;
+    [DisplayName("开关·免费公开接口")] [Description("歌词走 LRCLIB 与网易云官方、封面与试听走 iTunes、通用链接卡自己抓页面 meta 解析；全部免注册免 key")]
+    public bool EnableFreeSources { get; set; } = true;
+    [DisplayName("开关·允许 microlink 兜底")] [Description("默认关。开：自抓拿不到标题时，把你要发的那个 URL 交给第三方 microlink 解析（等于外泄你在查什么），只在自抓失败且你不介意时开")]
+    public bool EnableMicrolink { get; set; } = false;
+    [DisplayName("免费接口超时（秒）")] [Description("单个免费接口的超时；国际站直连经常不通，超时给短点别拖着整条链")]
+    public int FreeSourceTimeoutSeconds { get; set; } = 12;
 }
 
 [Module("QQ分享卡片",
     "自己完成音乐卡与通用分享卡签名并直塞协议端，不依赖协议端的签名地址配置",
     defaultCategory: "苏染的工具",
     EditorUI = typeof(ShareArkUI))]
-public class ShareArkModule(
+public partial class ShareArkModule(
     XmlFunctionCaller functionCaller,
     ILogger<ShareArkModule> logger,
     Interactor<ShareArkModule> interactor
@@ -97,7 +104,11 @@ public class ShareArkModule(
 {
     public ShareArkConfig Configuration { get; set; } = null!;
 
-    static readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(20) };
+    static readonly HttpClient http = new(new HttpClientHandler {
+        // 实测：B站这类站即使请求没带 Accept-Encoding 也照回 Content-Encoding: gzip，
+        // 不自动解压就读到一坨压缩字节，抓网页 meta（标题/预览图）全军覆没
+        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
+    }) { Timeout = TimeSpan.FromSeconds(20) };
 
     // 由基地址推导三个接口地址，填一个基地址就能用全部功能
     string Base()
@@ -1491,7 +1502,19 @@ public class ShareArkModule(
             JsonElement items = doc.RootElement.GetProperty("data").GetProperty("song").GetProperty("itemlist").Clone();
             foreach (JsonElement item in items.EnumerateArray())
             {
-                results.Add((GetStringField(item, "songmid"), GetStringField(item, "songname"), GetStringField(item, "singer")));
+                // 实测 smartbox 的 itemlist 字段是 mid/name（老写法 songmid/songname 在这接口上取不到，
+                // 会静默给个空 id，后面详情与签名全废），两个名字都认一下
+                string songMid = GetStringField(item, "mid");
+                if (songMid.Length == 0)
+                {
+                    songMid = GetStringField(item, "songmid");
+                }
+                string songName = GetStringField(item, "name");
+                if (songName.Length == 0)
+                {
+                    songName = GetStringField(item, "songname");
+                }
+                results.Add((songMid, songName, GetStringField(item, "singer")));
             }
         }
         else if (platform == "kugou")
@@ -1499,8 +1522,17 @@ public class ShareArkModule(
             using HttpRequestMessage request = new(HttpMethod.Get,
                 "https://mobilecdn.kugou.com/api/v3/search/song?format=json&pagesize=5&page=1&keyword=" + Uri.EscapeDataString(keyword));
             request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
-            string body = await (await http.SendAsync(request)).Content.ReadAsStringAsync();
-            using JsonDocument doc = JsonDocument.Parse(body);
+            string kugouBody;
+            try
+            {
+                using HttpResponseMessage kugou = await http.SendAsync(request);
+                kugouBody = await kugou.Content.ReadAsStringAsync();
+            }
+            catch (Exception kugouError)
+            {
+                throw new Exception("酷狗这个搜索接口在当前网络连不上（" + kugouError.Message.Split('\n')[0] + "），搜歌先换 163 或 qq");
+            }
+            using JsonDocument doc = JsonDocument.Parse(kugouBody);
             JsonElement infoList = doc.RootElement.GetProperty("data").GetProperty("info").Clone();
             foreach (JsonElement item in infoList.EnumerateArray())
             {
@@ -1626,7 +1658,9 @@ public class ShareArkModule(
             req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
             // 页面抓取只给8秒：国外站连不上时别拖满20秒全局超时
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
-            string html = await (await http.SendAsync(req, cts.Token)).Content.ReadAsStringAsync(cts.Token);
+            // 按字节读回来自己解码：有些站回 charset=UTF-8（大写），ReadAsStringAsync 会直接抛
+            using HttpResponseMessage page = await http.SendAsync(req, cts.Token);
+            string html = Encoding.UTF8.GetString(await page.Content.ReadAsByteArrayAsync(cts.Token));
             m.title = Meta(html, "og:title") ?? Meta(html, "twitter:title") ?? "";
             m.desc = Meta(html, "og:description") ?? Meta(html, "description") ?? "";
             m.image = Meta(html, "og:image") ?? Meta(html, "twitter:image") ?? "";
@@ -2027,8 +2061,10 @@ public class ShareArkModule(
     {
         XmlHandler handler = new(this)
         {
-            Description = "把网页链接或歌曲/视频做成QQ分享卡片并发送，并提供B站系列查询（解析/用户/更新/热门/登录）。",
-            Explanation = "搜索用 SearchMusic / SearchBili，发卡用 SendArkCard / SendShareCard；B站系列：BiliParse 解析链接、BiliUserInfo 查用户、BiliUpdates 查UP主更新、BiliHot 查热门、BiliQrLogin 扫码登录、BiliCookieRefresh 刷新登录态、BiliCookie 管理登录Cookie；IpLookup 查IP归属。都需要已配置第三方基地址和ApiKey。ProbeBase 探测三个签名/搜索接口通不通，ProbeAll 列出基地址下发现的所有接口。"
+            Description = "把网页链接或歌曲/视频做成QQ分享卡片并发送，并提供B站系列查询（解析/用户/更新/热门/登录）；另有免key的歌词/封面/链接素材公开接口。",
+            Explanation = "搜索用 SearchMusic / SearchBili，发卡用 SendArkCard / SendShareCard；B站系列：BiliParse 解析链接、BiliUserInfo 查用户、BiliUpdates 查UP主更新、BiliHot 查热门、BiliQrLogin 扫码登录、BiliCookieRefresh 刷新登录态、BiliCookie 管理登录Cookie；IpLookup 查IP归属。这些都要已配置第三方基地址和ApiKey。ProbeBase 探测三个签名/搜索接口通不通，ProbeAll 列出基地址下发现的所有接口。"
+                + "另一批不要 key、不要配置的走公开接口：ArkLyric 取歌词（LRCLIB 与网易云官方）、ArkCover 找封面与试听（iTunes）、ArkLinkMeta 自己抓页面 meta 出卡片素材、ArkFreeProbe 体检这些源。"
+                + "发卡片前的素材可以先用它们备着，但签名与发送仍走第三方签名服务。"
         };
         functionCaller.RegisterHandler(handler, DocumentMode.Implicit, cancellationToken: DestroyCancellationToken);
         return Task.CompletedTask;
