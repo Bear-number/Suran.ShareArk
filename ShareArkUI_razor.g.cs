@@ -591,33 +591,6 @@ Configuration.EnableSearchMusic
             __builder.AddMarkupContent(84, "\n            ");
             __builder.AddMarkupContent(85, "<div><div class=\"sk-name\">搜歌</div>\n                <div class=\"sk-desc\">SearchMusic：按关键词搜歌拿ID再发卡，支持163/qq/kugou</div></div>");
             __builder.CloseElement();
-            __builder.AddMarkupContent(86, "\n        ");
-            __builder.OpenElement(87, "div");
-            __builder.AddAttribute(88, "class", "sk-switch");
-            __builder.OpenComponent<global::AntDesign.Switch>(89);
-            __builder.AddComponentParameter(90, nameof(global::AntDesign.Switch.
-#nullable restore
-#line (61,27)-(61,32) "C:\Users\Delet\Desktop\Qoder-workspace\ShareArkUI\ShareArkUI.razor"
-Value
-
-#line default
-#line hidden
-#nullable disable
-            ), global::Microsoft.AspNetCore.Components.CompilerServices.RuntimeHelpers.TypeCheck<global::System.Boolean>(
-#nullable restore
-#line (61,35)-(61,65) "C:\Users\Delet\Desktop\Qoder-workspace\ShareArkUI\ShareArkUI.razor"
-Configuration.EnableSearchBili
-
-#line default
-#line hidden
-#nullable disable
-            ));
-            __builder.AddComponentParameter(91, nameof(global::AntDesign.Switch.ValueChanged), global::Microsoft.AspNetCore.Components.CompilerServices.RuntimeHelpers.TypeCheck<global::Microsoft.AspNetCore.Components.EventCallback<global::System.Boolean>>(global::Microsoft.AspNetCore.Components.EventCallback.Factory.Create<global::System.Boolean>(this, global::Microsoft.AspNetCore.Components.CompilerServices.RuntimeHelpers.CreateInferredEventCallback(this, __value => Configuration.EnableSearchBili = __value, Configuration.EnableSearchBili))));
-            __builder.AddComponentParameter(92, nameof(global::AntDesign.Switch.ValueExpression), global::Microsoft.AspNetCore.Components.CompilerServices.RuntimeHelpers.TypeCheck<global::System.Linq.Expressions.Expression<global::System.Func<global::System.Boolean>>>(() => Configuration.EnableSearchBili));
-            __builder.CloseComponent();
-            __builder.AddMarkupContent(93, "\n            ");
-            __builder.AddMarkupContent(94, "<div><div class=\"sk-name\">B站搜索</div>\n                <div class=\"sk-desc\">SearchBili：搜B站视频拿BV号；配了第三方搜索接口走第三方，否则走B站官方</div></div>");
-            __builder.CloseElement();
             __builder.AddMarkupContent(95, "\n        ");
             __builder.OpenElement(96, "div");
             __builder.AddAttribute(97, "class", "sk-switch");
@@ -645,33 +618,6 @@ Configuration.EnableBiliParse
             __builder.AddMarkupContent(102, "\n            ");
             __builder.AddMarkupContent(103, "<div><div class=\"sk-name\">B站链接解析</div>\n                <div class=\"sk-desc\">BiliParse：解析B站链接（视频/短链/专栏/番剧/直播间），可取播放直链</div></div>");
             __builder.CloseElement();
-            __builder.AddMarkupContent(104, "\n        ");
-            __builder.OpenElement(105, "div");
-            __builder.AddAttribute(106, "class", "sk-switch");
-            __builder.OpenComponent<global::AntDesign.Switch>(107);
-            __builder.AddComponentParameter(108, nameof(global::AntDesign.Switch.
-#nullable restore
-#line (75,27)-(75,32) "C:\Users\Delet\Desktop\Qoder-workspace\ShareArkUI\ShareArkUI.razor"
-Value
-
-#line default
-#line hidden
-#nullable disable
-            ), global::Microsoft.AspNetCore.Components.CompilerServices.RuntimeHelpers.TypeCheck<global::System.Boolean>(
-#nullable restore
-#line (75,35)-(75,67) "C:\Users\Delet\Desktop\Qoder-workspace\ShareArkUI\ShareArkUI.razor"
-Configuration.EnableBiliUserInfo
-
-#line default
-#line hidden
-#nullable disable
-            ));
-            __builder.AddComponentParameter(109, nameof(global::AntDesign.Switch.ValueChanged), global::Microsoft.AspNetCore.Components.CompilerServices.RuntimeHelpers.TypeCheck<global::Microsoft.AspNetCore.Components.EventCallback<global::System.Boolean>>(global::Microsoft.AspNetCore.Components.EventCallback.Factory.Create<global::System.Boolean>(this, global::Microsoft.AspNetCore.Components.CompilerServices.RuntimeHelpers.CreateInferredEventCallback(this, __value => Configuration.EnableBiliUserInfo = __value, Configuration.EnableBiliUserInfo))));
-            __builder.AddComponentParameter(110, nameof(global::AntDesign.Switch.ValueExpression), global::Microsoft.AspNetCore.Components.CompilerServices.RuntimeHelpers.TypeCheck<global::System.Linq.Expressions.Expression<global::System.Func<global::System.Boolean>>>(() => Configuration.EnableBiliUserInfo));
-            __builder.CloseComponent();
-            __builder.AddMarkupContent(111, "\n            ");
-            __builder.AddMarkupContent(112, "<div><div class=\"sk-name\">B站用户查询</div>\n                <div class=\"sk-desc\">BiliUserInfo：按UID查昵称、等级、粉丝数、签名、认证、投稿数</div></div>");
-            __builder.CloseElement();
             __builder.AddMarkupContent(113, "\n        ");
             __builder.OpenElement(114, "div");
             __builder.AddAttribute(115, "class", "sk-switch");
@@ -698,33 +644,6 @@ Configuration.EnableBiliUpdates
             __builder.CloseComponent();
             __builder.AddMarkupContent(120, "\n            ");
             __builder.AddMarkupContent(121, "<div><div class=\"sk-name\">UP主更新查询</div>\n                <div class=\"sk-desc\">BiliUpdates：查UP主最新动态/视频/专栏，视频带BV号可直接发卡</div></div>");
-            __builder.CloseElement();
-            __builder.AddMarkupContent(122, "\n        ");
-            __builder.OpenElement(123, "div");
-            __builder.AddAttribute(124, "class", "sk-switch");
-            __builder.OpenComponent<global::AntDesign.Switch>(125);
-            __builder.AddComponentParameter(126, nameof(global::AntDesign.Switch.
-#nullable restore
-#line (89,27)-(89,32) "C:\Users\Delet\Desktop\Qoder-workspace\ShareArkUI\ShareArkUI.razor"
-Value
-
-#line default
-#line hidden
-#nullable disable
-            ), global::Microsoft.AspNetCore.Components.CompilerServices.RuntimeHelpers.TypeCheck<global::System.Boolean>(
-#nullable restore
-#line (89,35)-(89,62) "C:\Users\Delet\Desktop\Qoder-workspace\ShareArkUI\ShareArkUI.razor"
-Configuration.EnableBiliHot
-
-#line default
-#line hidden
-#nullable disable
-            ));
-            __builder.AddComponentParameter(127, nameof(global::AntDesign.Switch.ValueChanged), global::Microsoft.AspNetCore.Components.CompilerServices.RuntimeHelpers.TypeCheck<global::Microsoft.AspNetCore.Components.EventCallback<global::System.Boolean>>(global::Microsoft.AspNetCore.Components.EventCallback.Factory.Create<global::System.Boolean>(this, global::Microsoft.AspNetCore.Components.CompilerServices.RuntimeHelpers.CreateInferredEventCallback(this, __value => Configuration.EnableBiliHot = __value, Configuration.EnableBiliHot))));
-            __builder.AddComponentParameter(128, nameof(global::AntDesign.Switch.ValueExpression), global::Microsoft.AspNetCore.Components.CompilerServices.RuntimeHelpers.TypeCheck<global::System.Linq.Expressions.Expression<global::System.Func<global::System.Boolean>>>(() => Configuration.EnableBiliHot));
-            __builder.CloseComponent();
-            __builder.AddMarkupContent(129, "\n            ");
-            __builder.AddMarkupContent(130, "<div><div class=\"sk-name\">B站热门/相关</div>\n                <div class=\"sk-desc\">BiliHot：B站热门视频榜，或某个视频的相关推荐</div></div>");
             __builder.CloseElement();
             __builder.AddMarkupContent(131, "\n        ");
             __builder.OpenElement(132, "div");

@@ -58,20 +58,14 @@ public class ShareArkConfig
     // ── 功能开关：关闭后对应函数对AI不可用（默认全开，老配置缺省即开） ──
     [DisplayName("开关·搜歌")] [Description("关闭后 SearchMusic 不可用")]
     public bool EnableSearchMusic { get; set; } = true;
-    [DisplayName("开关·B站搜索")] [Description("关闭后 SearchBili 不可用")]
-    public bool EnableSearchBili { get; set; } = true;
     [DisplayName("开关·发音乐/视频卡")] [Description("关闭后 SendArkCard 不可用")]
     public bool EnableSendArkCard { get; set; } = true;
     [DisplayName("开关·发通用分享卡")] [Description("关闭后 SendShareCard 不可用")]
     public bool EnableSendShareCard { get; set; } = true;
     [DisplayName("开关·B站链接解析")] [Description("关闭后 BiliParse 不可用")]
     public bool EnableBiliParse { get; set; } = true;
-    [DisplayName("开关·B站用户查询")] [Description("关闭后 BiliUserInfo 不可用")]
-    public bool EnableBiliUserInfo { get; set; } = true;
     [DisplayName("开关·UP主更新查询")] [Description("关闭后 BiliUpdates 不可用")]
     public bool EnableBiliUpdates { get; set; } = true;
-    [DisplayName("开关·B站热门/相关")] [Description("关闭后 BiliHot 不可用")]
-    public bool EnableBiliHot { get; set; } = true;
     [DisplayName("开关·B站扫码登录")] [Description("关闭后 BiliQrLogin 不可用")]
     public bool EnableBiliQrLogin { get; set; } = true;
     [DisplayName("开关·Cookie刷新")] [Description("关闭后 BiliCookieRefresh 不可用")]
@@ -477,20 +471,6 @@ public partial class ShareArkModule(
         }
     }
 
-    [XmlFunction(FunctionMode.OneShot)]
-    [Description("搜索B站视频拿BV号，用于再发卡片。配置了B站搜索接口地址就走第三方，否则走B站官方")]
-    public async Task SearchBili([Description("视频关键词")] string keyword)
-    {
-        if (Gate(Configuration.EnableSearchBili, "B站搜索")) return;
-        try
-        {
-            var hits = (await BiliSearchAsync(keyword)).Take(5);
-            var lines = hits.Select(h => h.bv + " - " + h.title).ToList();
-            if (lines.Count == 0) lines.Add("没搜到");
-            interactor.Poke(string.Join("\n", lines));
-        }
-        catch (Exception ex) { interactor.Poke("搜索失败：" + ex.Message); }
-    }
 
     // B站视频搜索统一入口：配置了第三方接口优先走第三方（失败按容灾配置转官方），否则走B站官方，都归一成 (BV号, 标题) 列表
     async Task<List<(string bv, string title)>> BiliSearchAsync(string keyword)
@@ -598,7 +578,7 @@ public partial class ShareArkModule(
         }
     }
 
-    [XmlFunction(FunctionMode.OneShot)]
+    [XmlFunction(FunctionMode.OneShot, order: -1)]
     [Description("把任意网页链接拼成QQ分享卡发出（通用链接卡，走分享卡签名接口）。title标题，desc描述，url跳转链接，preview预览图可留空，prompt提示文本可留空，type不填默认group")]
     public async Task SendShareCard(
         [Description("跳转链接")] string url,
@@ -727,7 +707,7 @@ public partial class ShareArkModule(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("解析B站链接（视频/b23.tv短链/专栏/番剧/直播间），返回类型、ID、标题、UP主等详情；action=play 时额外返回视频播放直链")]
+    [Description("解析B站链接（视频/b23.tv短链/专栏/番剧/直播间），返回类型、ID、标题、UP主等详情；action=play 额外返回视频播放直链——**取播放直链、解析短链/专栏/番剧/直播间只能用这个，Suran.Bili 没有这些能力**。只想要视频统计和分P列表的，用 Suran.Bili 的 BiliVideo")]
     public async Task BiliParse(
         [Description("B站链接")] string url,
         [Description("id=仅类型和ID；detail=详情（默认）；play=额外返回播放直链")] string? action = null,
@@ -776,35 +756,7 @@ public partial class ShareArkModule(
         return string.Join("\n", rep);
     }
 
-    [XmlFunction(FunctionMode.OneShot)]
-    [Description("通过UID查询B站用户信息：昵称、等级、粉丝数、签名、认证、投稿数等")]
-    public async Task BiliUserInfo([Description("用户mid")] long uid)
-    {
-        if (Gate(Configuration.EnableBiliUserInfo, "B站用户查询")) return;
-        try
-        {
-            interactor.Poke(await BiliUserInfoThirdPartyAsync(uid));
-        }
-        catch (Exception thirdPartyError)
-        {
-            await FallbackOrReportAsync("用户查询", thirdPartyError, () => OfficialBiliUserInfoAsync(uid));
-        }
-    }
 
-    async Task<string> BiliUserInfoThirdPartyAsync(long uid)
-    {
-        var d = await ApiCall("bili-user-info", ("uid", uid.ToString()));
-        var rep = new List<string> { S(d, "name") + "（" + S(d, "mid") + "）" };
-        string vip = S(d, "vip_label");
-        rep.Add("等级 " + S(d, "level") + (vip.Length > 0 ? "，" + vip : ""));
-        rep.Add("粉丝 " + S(d, "fans") + "，关注 " + S(d, "following") + "，获赞 " + S(d, "likes"));
-        rep.Add("投稿视频 " + S(d, "archive_count") + "，专栏 " + S(d, "article_count"));
-        string sign = S(d, "sign");
-        if (sign.Length > 0) rep.Add("签名：" + sign);
-        if (d.TryGetProperty("official", out var of) && of.ValueKind == JsonValueKind.Object && S(of, "title").Length > 0)
-            rep.Add("认证：" + S(of, "title"));
-        return string.Join("\n", rep);
-    }
 
     [XmlFunction(FunctionMode.OneShot)]
     [Description("查询B站UP主最新动态/视频/专栏更新，可翻页；视频更新带BV号，可直接拿去发卡片")]
@@ -840,45 +792,10 @@ public partial class ShareArkModule(
         return string.Join("\n", rep);
     }
 
-    [XmlFunction(FunctionMode.OneShot)]
-    [Description("获取B站热门视频榜，或某个视频的相关推荐（related 需传bvid）")]
-    public async Task BiliHot(
-        [Description("popular=热门榜（默认）/related=相关推荐")] string? action = null,
-        [Description("相关推荐时的视频BV号")] string? bvid = null,
-        [Description("热门榜页码，默认1，每页100")] int? pn = null)
-    {
-        if (Gate(Configuration.EnableBiliHot, "B站热门/相关")) return;
-        try
-        {
-            interactor.Poke(await BiliHotThirdPartyAsync(action, bvid, pn));
-        }
-        catch (Exception thirdPartyError)
-        {
-            await FallbackOrReportAsync("热门/相关查询", thirdPartyError, () => OfficialBiliHotAsync(action, bvid, pn));
-        }
-    }
 
-    async Task<string> BiliHotThirdPartyAsync(string? action, string? bvid, int? pn)
-    {
-        string a = (action ?? "popular").Trim().ToLowerInvariant();
-        var d = await ApiCall("bili-hot-recommend", ("action", a), ("bvid", bvid), ("pn", pn?.ToString()));
-        var rep = new List<string>();
-        int n = 0;
-        foreach (var it in d.GetProperty("items").EnumerateArray())
-        {
-            if (n >= 10) break;
-            string line = (it.TryGetProperty("ranking", out var rk) ? rk.GetInt32() + ". " : "") + S(it, "bvid") + " - " + S(it, "title");
-            if (it.TryGetProperty("owner", out var ow2) && ow2.ValueKind == JsonValueKind.Object) line += " - " + S(ow2, "name");
-            if (S(it, "view_text").Length > 0) line += " [" + S(it, "view_text") + "播放]";
-            rep.Add(line);
-            n++;
-        }
-        if (rep.Count == 0) rep.Add("没有内容");
-        return string.Join("\n", rep);
-    }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("B站扫码登录：action=generate 申请二维码（把返回的二维码链接发出来让人扫），action=poll 用 qrcode_key 查登录状态；登录成功返回 cookie_id")]
+    [Description("【第三方接口的凭据，不是你的B站账号】扫码登录后拿到 cookie_id，供 ShareArk 的第三方接口调用使用。要登录本机B站账号（收藏/历史/动态等）请用 Suran.Bili 的 BiliLogin。action=generate 申请二维码（把二维码链接只发给主人本人），action=poll 用 qrcode_key 查状态")]
     public async Task BiliQrLogin(
         [Description("generate=申请二维码 / poll=轮询登录状态")] string action,
         [Description("action=poll时填 generate 返回的 qrcode_key")] string? qrcodeKey = null)
@@ -907,7 +824,7 @@ public partial class ShareArkModule(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("刷新或检查服务器保存的B站登录Cookie，延长有效期；action=check 仅检查是否需要刷新，refresh=执行刷新（默认）")]
+    [Description("【第三方接口的凭据，不是你的B站账号】刷新或检查第三方接口保存的B站Cookie，延长有效期；action=check 仅检查是否需要刷新，refresh=执行刷新（默认）。本机B站登录态的问题请用 Suran.Bili 的 BiliEnv/BiliLogin")]
     public async Task BiliCookieRefresh(
         [Description("Cookie唯一标识ID")] string cookieId,
         [Description("check=仅检查 / refresh=执行刷新（默认）")] string? action = null)
@@ -934,7 +851,7 @@ public partial class ShareArkModule(
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("管理服务器保存的B站登录Cookie：list=列出全部（默认，不含敏感字段）/check=验证登录态/delete=删除/save=导入Cookie字符串。故意不提供导出完整Cookie的动作，避免凭据进入聊天记录")]
+    [Description("【第三方接口的凭据，不是你的B站账号】管理第三方接口保存的B站Cookie：list=列出全部（默认，不含敏感字段）/check=验证登录态/delete=删除/save=导入Cookie字符串。故意不提供导出完整Cookie的动作，避免凭据进入聊天记录。本机B站账号请看 Suran.Bili 的 BiliLogin(action=check)")]
     public async Task BiliCookie(
         [Description("list=列出/check=验证/delete=删除/save=导入")] string? action = null,
         [Description("Cookie唯一标识ID，check/delete时填")] string? cookieId = null,
@@ -1204,25 +1121,6 @@ public partial class ShareArkModule(
         throw new Exception("无法从链接中识别B站资源（支持视频/短链/专栏/番剧/直播间）");
     }
 
-    // ---- BiliUserInfo 官方实现：wbi acc/info + relation/stat ----
-    async Task<string> OfficialBiliUserInfoAsync(long uid)
-    {
-        Dictionary<string, string> parameters = new() { ["mid"] = uid.ToString(CultureInfo.InvariantCulture) };
-        string query = await BuildWbiQueryAsync(parameters);
-        JsonElement info = await BiliOfficialGetAsync(BiliApiBase + "/x/space/wbi/acc/info?" + query);
-        JsonElement relation = await BiliOfficialGetAsync(BiliApiBase + "/x/relation/stat?vmid=" + uid.ToString(CultureInfo.InvariantCulture));
-        var rep = new List<string> { S(info, "name") + "（" + S(info, "mid") + "）" };
-        rep.Add("等级 " + S(info, "level"));
-        rep.Add("粉丝 " + S(relation, "follower"));
-        string sign = S(info, "sign");
-        if (sign.Length > 0) rep.Add("签名：" + sign);
-        if (info.TryGetProperty("official", out JsonElement official) && official.ValueKind == JsonValueKind.Object && S(official, "title").Length > 0)
-        {
-            rep.Add("认证：" + S(official, "title"));
-        }
-        return string.Join("\n", rep);
-    }
-
     // ---- BiliUpdates 官方实现：动态接口（视频投稿，无需WBI） ----
     async Task<string> OfficialBiliUpdatesAsync(long uid)
     {
@@ -1275,50 +1173,6 @@ public partial class ShareArkModule(
         if (rep.Count == 0)
         {
             rep.Add("没有取到视频投稿（官方容灾仅支持视频投稿；动态/专栏请等第三方恢复后查询）");
-        }
-        return string.Join("\n", rep);
-    }
-
-    // ---- BiliHot 官方实现：popular 热门榜 + archive/related 相关推荐 ----
-    async Task<string> OfficialBiliHotAsync(string? action, string? bvid, int? pn)
-    {
-        string normalized = (action ?? "popular").Trim().ToLowerInvariant();
-        List<JsonElement> entries = new();
-        if (normalized == "related")
-        {
-            if (string.IsNullOrWhiteSpace(bvid))
-            {
-                throw new Exception("相关推荐需要传 bvid");
-            }
-            JsonElement data = await BiliOfficialGetAsync(BiliApiBase + "/x/web-interface/archive/related?bvid="
-                + Uri.EscapeDataString(bvid));
-            if (data.ValueKind == JsonValueKind.Array)
-            {
-                entries = data.EnumerateArray().Take(10).Select(item => item.Clone()).ToList();
-            }
-        }
-        else
-        {
-            JsonElement data = await BiliOfficialGetAsync(BiliApiBase + "/x/web-interface/popular?ps=20&pn="
-                + Math.Max(1, pn ?? 1).ToString(CultureInfo.InvariantCulture));
-            if (data.ValueKind == JsonValueKind.Object && data.TryGetProperty("list", out JsonElement list) && list.ValueKind == JsonValueKind.Array)
-            {
-                entries = list.EnumerateArray().Take(10).Select(item => item.Clone()).ToList();
-            }
-        }
-        var rep = new List<string>();
-        int index = 0;
-        foreach (JsonElement item in entries)
-        {
-            index++;
-            string upName = item.TryGetProperty("owner", out JsonElement owner) && owner.ValueKind == JsonValueKind.Object
-                ? S(owner, "name")
-                : "";
-            rep.Add(index + ". " + S(item, "bvid") + " - " + S(item, "title") + (upName.Length > 0 ? " - " + upName : ""));
-        }
-        if (rep.Count == 0)
-        {
-            rep.Add("没有内容");
         }
         return string.Join("\n", rep);
     }
@@ -2061,8 +1915,10 @@ public partial class ShareArkModule(
     {
         XmlHandler handler = new(this)
         {
-            Description = "把网页链接或歌曲/视频做成QQ分享卡片并发送，并提供B站系列查询（解析/用户/更新/热门/登录）；另有免key的歌词/封面/链接素材公开接口。",
-            Explanation = "搜索用 SearchMusic / SearchBili，发卡用 SendArkCard / SendShareCard；B站系列：BiliParse 解析链接、BiliUserInfo 查用户、BiliUpdates 查UP主更新、BiliHot 查热门、BiliQrLogin 扫码登录、BiliCookieRefresh 刷新登录态、BiliCookie 管理登录Cookie；IpLookup 查IP归属。这些都要已配置第三方基地址和ApiKey。ProbeBase 探测三个签名/搜索接口通不通，ProbeAll 列出基地址下发现的所有接口。"
+            Description = "把网页链接或歌曲/视频做成QQ分享卡片并发送，并提供B站链接解析/UP主更新/扫码登录；另有免key的歌词/封面/链接素材公开接口。",
+            Explanation = "搜歌用 SearchMusic，发卡用 SendArkCard / SendShareCard；B站系列：BiliParse 解析链接（**播放直链、b23短链、专栏/番剧/直播间只有这里有**）、BiliUpdates 查UP主更新、BiliQrLogin 扫码登录（**这是本插件第三方接口的凭据池，不是你本机的B站账号**）、BiliCookieRefresh 刷新登录态、BiliCookie 管理登录Cookie；IpLookup 查IP归属。这些都要已配置第三方基地址和ApiKey。"
+                + "搜索B站视频、查视频详情、查UP主资料、看热门榜，一律用 Suran.Bili 插件的 BiliSearch / BiliVideo / BiliUser / BiliHot（走本机 cookie，结果与你在B站看到的一致，也没有第三方限额）；本插件不再提供这些，只留发卡片和上面那些 Suran.Bili 没有的能力。"
+                + "ProbeBase 探测三个签名/搜索接口通不通，ProbeAll 列出基地址下发现的所有接口。"
                 + "另一批不要 key、不要配置的走公开接口：ArkLyric 取歌词（LRCLIB 与网易云官方）、ArkCover 找封面与试听（iTunes）、ArkLinkMeta 自己抓页面 meta 出卡片素材、ArkFreeProbe 体检这些源。"
                 + "发卡片前的素材可以先用它们备着，但签名与发送仍走第三方签名服务。"
         };

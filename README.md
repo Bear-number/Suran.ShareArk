@@ -4,7 +4,18 @@
 QQ 分享卡片插件（音乐卡 + 通用链接卡），签名由插件自己完成，直塞协议端 ws，不依赖协议端自带的签名地址配置。
 
 ## 版本
-5.1.0（对应 Alife 客户端 5.0.x）
+5.1.2（对应 Alife 客户端 5.0.x）
+
+## 5.1.2 的改动
+- **删掉三个与 Suran.Bili 重复的函数**：`SearchBili`、`BiliUserInfo`、`BiliHot`，连同它们的第三方实现、官方兜底实现、三个配置开关和设置页里对应的开关（设置页 14 个开关，原 17 个）。
+  理由是功能完全被 Suran.Bili 覆盖，而且那边走本机 cookie、结果与用户自己在B站看到的一致、没有第三方限额。
+  `BiliSearchAsync` 保留——发卡片时内部还要用它把标题解析出来（不是给 AI 调用的）。
+- 5.1.1 那轮的「靠 Description 分工」被这一步取代：说明写得再清楚，也不如只留一份。`BiliParse` 的独占能力（播放直链、b23 短链、专栏/番剧/直播间）继续留在本插件。
+- 插件总说明 `Explanation` 同步改写：告诉 AI 搜视频/查详情/查用户/看热门一律去 Suran.Bili，本插件只负责发卡片和 Suran.Bili 没有的能力。
+- 删掉 1283 行附近两段已经指不到方法的孤儿分节注释。
+
+## 5.1.1 的改动（历史）
+- 与 Suran.Bili 划清分工（当时只改函数说明）：`BiliParse` 标明独占能力；`BiliQrLogin` / `BiliCookie` / `BiliCookieRefresh` 标明是**第三方接口的凭据池，不是本机 B 站账号**，要登录自己账号用 `BiliLogin`。
 
 ## 5.1.0 的改动
 - 接入一批**免注册免 key 的公开接口**做歌词/封面/链接素材来源（`ArkLyric` / `ArkCover` / `ArkLinkMeta` / `ArkFreeProbe`），详见下面「免费公开接口」
@@ -22,7 +33,7 @@ QQ 分享卡片插件（音乐卡 + 通用链接卡），签名由插件自己�
 配置开关「容灾·启用官方接口回退」（默认开）：第三方接口调用失败时**自动切换官方公开接口**，双失败才报错（附双方原因）。
 - **音乐卡**：163/qq 走 OneBot 标准音乐段（`{"type":"music","data":{"type":"163"|"qq","id":...}}`，协议端原生生成卡片，歌名自动搜用平台公开接口）；bilibili/kugou 走 custom 音乐段（bilibili 的音频直链取自官方 playurl，kugou 降级为跳转卡）
 - **搜索**：163（music.163.com 搜索）、qq（c.y.qq.com smartbox）、kugou（mobilecdn.kugou.com v3）
-- **B站系列**：BiliParse（URL解析+view详情+playurl直链）、BiliUserInfo（wbi acc/info，自动WBI签名）、BiliUpdates（动态feed，仅视频投稿）、BiliHot（popular/related）、BiliQrLogin（passport扫码，**Cookie自动存本地**）、BiliCookie（本地管理）
+- **B站系列**：BiliParse（URL解析+view详情+playurl直链）、BiliUpdates（动态feed，仅视频投稿）、BiliQrLogin（passport扫码，**Cookie自动存本地**）、BiliCookie（本地管理）
 - Cookie 本地保存于 `{存储目录}/ShareArk/bili_cookie.txt`，官方接口自动携带以降低风控
 - 通用分享卡无官方替代（Ark签名必须第三方），第三方不可用时明确报错
 
@@ -101,7 +112,6 @@ QQ 分享卡片插件（音乐卡 + 通用链接卡），签名由插件自己�
 - ProbeBase() - 探测三个接口通不通（手动地址或自动后缀都会报出来），换新接口先跑一次
 - ProbeAll() - 列出基地址下发现的所有接口（openapi/swagger 文档 + 站点首页接口链接，只列举不调用不耗次数），标注插件在用哪些
 - SearchMusic(keyword, platform) - 搜歌拿 ID，platform: 163/qq/kugou
-- SearchBili(keyword) - 搜 B 站拿 BV 号，配置了 BiliSearchUrl 走第三方，否则走官方
 - SendArkCard(platform, id, targetId, type, title) - platform: 163/qq/bilibili/kugou
 - SendShareCard(url, title, desc, preview, prompt, targetId, type) - 任意链接转分享卡，标题/描述/预览图自动抓
 - IpLookup(ip) - 查IP的地理位置/运营商/ASN/时区，不填查本机出口IP
@@ -112,9 +122,7 @@ QQ 分享卡片插件（音乐卡 + 通用链接卡），签名由插件自己�
 
 ## B站系列（走 {BaseUrl}/bili-*，需 ApiKey，即咸鱼API哔哩哔哩系列）
 - BiliParse(url, action, qn) - 解析B站链接（视频/短链/专栏/番剧/直播间），action=play 返回播放直链，qn 选清晰度 80/64/32/16
-- BiliUserInfo(uid) - 查用户：昵称/等级/粉丝/签名/认证/投稿数
 - BiliUpdates(uid, type, offset) - 查UP主最新动态/视频/专栏，type: all/video/article，offset 翻页
-- BiliHot(action, bvid, pn) - 热门视频榜 popular 或视频相关推荐 related
 - BiliQrLogin(action, qrcodeKey) - 扫码登录：generate 出二维码链接给人扫，poll 查状态，成功得 cookie_id
 - BiliCookieRefresh(cookieId, action) - 刷新/检查登录Cookie有效期
 - BiliCookie(action, cookieId, cookieString) - Cookie管理：list/check/delete/save；故意不开放导出完整Cookie的 get 动作，避免凭据进聊天记录
