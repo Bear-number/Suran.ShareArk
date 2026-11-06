@@ -78,10 +78,20 @@ QQ 分享卡片插件（音乐卡 + 通用链接卡），签名由插件自己�
 | SearchUrl | 歌曲搜索接口完整地址，可留空；可含 {pf} 占位符（替换为 163/qq/kugou），不带占位符则三个平台共用同一地址 |
 | BiliSearchUrl | B站视频搜索接口完整地址，可留空，留空走B站官方接口 |
 | ApiKey | 第三方接口 Token，可留空（对方只要地址不要 key 时留空即可，插件不会带 key 参数）；以咸鱼API为例，注册/拿key：https://apii.xianyuw.cn |
-| WsUrl | 协议端 ws，默认 ws://127.0.0.1:3001 |
+| WsUrl | 空 | OneBot 正向 WebSocket。**留空 = 自动跟随「QQ 聊天」插件**的配置 |
+| OneBotToken | 空 | 协议端访问令牌。留空 = 跟随「QQ 聊天」插件 |
+| SignFailureCooldownSeconds | 签名失败后的冷却秒数，默认 300。签名端挂了的时候，这 5 分钟内点歌直接走备用方案，不再每次白等三四秒；填 0 = 每次都试 |
 | EnableFreeSources | 开关·免费公开接口，默认开；关掉后四个免费接口工具直接报「开关是关的」 |
 | EnableMicrolink | 开关·允许 microlink 兜底，**默认关**；开着才会把要发的链接交给外部解析 |
 | FreeSourceTimeoutSeconds | 免费接口超时（秒），默认 12（限 3~90） |
+
+**签名成功码不统一**：音乐卡返回 `code:200`，分享卡文档写的是 `code:0`。两边都认——只认 200 的话，分享卡签名成功也会被判成失败。
+
+**签名端挂了怎么办**：
+- 音乐卡还有备用路径：签不出 json 卡片时退到 OneBot 标准音乐段（`EnableOfficialFallback`，默认开），歌还是能点、能放。
+- 链接卡会退成**一条普通图文消息**：预览图 + 「【标题】(描述) 链接」。图发不出去就退纯文字。卡片没了，但链接和图都在，群里不至于只看到一句失败。
+- 只有签名类失败才降级。B站链接被拦、网页抓不到这类不算，不会假装发出去。
+- 探测报告现在会写出真实 `code` 和 `msg`，不再是「返回体带 code 就算通」——以前服务端回 `code:500` 也显示「通」，一片绿实际一个都签不出来。
 
 只填基地址就能用。首次调用时插件会拿默认后缀探一遍，不通就换候选后缀，试通的记住不再试：
 - `{BaseUrl}/qq-musicArk` 音乐卡签名
@@ -97,16 +107,15 @@ QQ 分享卡片插件（音乐卡 + 通用链接卡），签名由插件自己�
 |---|---|
 | BaseUrl | https://apii.xianyuw.cn/api/v1 |
 | ApiKey | 平台注册拿的 Token（搜索接口需 Token），注册/获取key：https://apii.xianyuw.cn |
-| BiliSearchUrl | https://apii.xianyuw.cn/api/bili-video-search（可选，B站搜索走第三方，默认走官方） |
+| BiliSearchUrl | https://apii.xianyuw.cn/api/v1/bili-video-search（可选，B站搜索走第三方，默认走官方。**注意是 /api/v1/，漏了 v1 拿到的是文档页 HTML**） |
 
 该站接口路径与默认后缀一致（/api/v1/qq-musicArk、/api/v1/qq-shareArk、/api/v1/163-music-search），填 BaseUrl 和 ApiKey 开箱即用，无需探测。
 
 ## 配置 UI
-- 模块带自定义配置界面（ShareArkUI）：顶部「探测接口」「列出全部接口」两个按钮，直接调运行中的模块，结果显示在按钮下方
+- 模块带自定义配置界面（ShareArkUI）：顶部「探测基地址」「全部探测」两个按钮，直接调运行中的模块，结果显示在按钮下方——内联一条等宽结果条，不是弹窗；这类报告是拿来对照着改配置的，多点一次关闭没有意义
 - **功能开关区**：17 个开关，每个开关旁写明功能说明（含对应AI函数名）；函数级开关默认全开，关闭后AI调用会收到「功能已关闭」提示；`EnableFreeSources` 是四个免费接口工具的总闸（默认开），`EnableMicrolink` 默认关
-- 接口配置表单手写内置；改动后记得点界面底部的保存
-- razor UI 不支持热编译：源码工程在 `../ShareArkUI/`（`dotnet build -c Release` 后把 `obj/Release/net10.0/generated/**/ShareArkUI_razor.g.cs` 拷到本插件文件夹即可）；这两个工程 5.1.0 起都改引在役客户端自带的程序集，不再指已删除的 AlifeSrc 源码树
-- `../ShareArkUI/PluginCheck/` 可随时整体编译验证插件源码 + g.cs 的组合（与宿主热编译同一套引用环境）
+- 配置表单不再手写：`ShareArkUI.cs` 一百来行，配置部分由 `SuranUiKit` 反射 `DisplayName` 里的 `分组·名称` 自动生成（可折叠卡片 + 搜索框），加字段不用再动界面。改动后记得点界面底部的保存
+- 原来的 `ShareArkUI_razor.g.cs`（1666 行生成代码，23 个配置项逐个列 FormItem）已删除。**以后不用再碰 `../ShareArkUI/` 那个 razor 工程**，也不会因为重新生成把改动盖掉
 
 ## 函数
 - ProbeBase() - 探测三个接口通不通（手动地址或自动后缀都会报出来），换新接口先跑一次

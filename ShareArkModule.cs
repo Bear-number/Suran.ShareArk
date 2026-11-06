@@ -24,16 +24,20 @@ namespace Suran.ShareArk;
 public class ShareArkConfig
 {
     [DisplayName("第三方接口基地址")]
-    [Description("填一个第三方签名服务基地址就行，音乐卡/分享卡/歌曲搜索接口地址会自动拼接，如 https://apii.xianyuw.cn/api/v1")]
+    [Description("第三方签名服务基地址。")]
     public string BaseUrl { get; set; } = "";
 
     [DisplayName("接口Token")]
-    [Description("第三方接口凭证key，可留空；咸鱼API到 https://apii.xianyuw.cn 注册后在个人中心获取")]
+    [Description("第三方接口凭证 key，可留空。")]
     public string ApiKey { get; set; } = "";
 
-    [DisplayName("协议端地址")]
-    [Description("OneBot正向WebSocket地址")]
-    public string WsUrl { get; set; } = "ws://127.0.0.1:3001";
+    [DisplayName("协议端·地址")]
+    [Description("留空 = 自动跟随「QQ 聊天」插件的配置（推荐）。填了就用这里的，例如 ws://127.0.0.1:3001")]
+    public string WsUrl { get; set; } = "";
+
+    [DisplayName("协议端·访问令牌")]
+    [Description("与协议端配置的 token 一致。留空 = 跟随「QQ 聊天」插件。填了地址却没填这里，协议端一开 token 就会连不上")]
+    public string OneBotToken { get; set; } = "";
 
     [DisplayName("音乐卡签名接口地址")]
     [Description("完整地址，可留空；留空时用基地址自动探测后缀拼出")]
@@ -48,11 +52,15 @@ public class ShareArkConfig
     public string SearchUrl { get; set; } = "";
 
     [DisplayName("B站搜索接口地址")]
-    [Description("B站视频搜索接口完整地址，可留空，留空走B站官方接口。第三方返回需为 {code,data:[{id,title}]} 结构")]
+    [Description("B站视频搜索接口完整地址，留空走官方接口。")]
     public string BiliSearchUrl { get; set; } = "";
 
+    [DisplayName("容灾·签名失败冷却秒")]
+    [Description("签名接口报错后，这么多秒内不再重试（直接走备用方案），避免每次点歌都白等三四秒。0 = 每次都试")]
+    public int SignFailureCooldownSeconds { get; set; } = 300;
+
     [DisplayName("容灾·启用官方接口回退")]
-    [Description("第三方接口调用失败时自动改用官方公开接口（音乐卡走官方音乐段、B站系列走B站web接口、搜索走平台公开接口）")]
+    [Description("第三方接口失败时是否自动改用官方接口。")]
     public bool EnableOfficialFallback { get; set; } = true;
 
     // ── 功能开关：关闭后对应函数对AI不可用（默认全开，老配置缺省即开） ──
@@ -80,7 +88,7 @@ public class ShareArkConfig
     public bool EnableProbeAll { get; set; } = true;
     [DisplayName("开关·免费公开接口")] [Description("歌词走 LRCLIB 与网易云官方、封面与试听走 iTunes、通用链接卡自己抓页面 meta 解析；全部免注册免 key")]
     public bool EnableFreeSources { get; set; } = true;
-    [DisplayName("开关·允许 microlink 兜底")] [Description("默认关。开：自抓拿不到标题时，把你要发的那个 URL 交给第三方 microlink 解析（等于外泄你在查什么），只在自抓失败且你不介意时开")]
+    [DisplayName("开关·允许 microlink 兜底")] [Description("自抓标题失败时是否用 microlink 解析，默认关。")]
     public bool EnableMicrolink { get; set; } = false;
     [DisplayName("免费接口超时（秒）")] [Description("单个免费接口的超时；国际站直连经常不通，超时给短点别拖着整条链")]
     public int FreeSourceTimeoutSeconds { get; set; } = 12;
@@ -97,6 +105,66 @@ public partial class ShareArkModule(
 ) : ChatBehaviour, IConfigurable<ShareArkConfig>
 {
     public ShareArkConfig Configuration { get; set; } = null!;
+
+    /// <summary>
+    /// 协议端连接信息。
+    ///
+    /// 地址留空时跟随「QQ 聊天」插件的配置——那是唯一值得人填一次的地方。
+    /// 换端口、给协议端开 token，都不用回来改这个插件，读它的配置就够。
+    /// 读不到就退回上一个版本的默认值，行为和以前完全一致。
+    /// </summary>
+    (string Url, string Token, string Source) ResolveOneBot()
+    {
+        string url = (Configuration.WsUrl ?? "").Trim();
+        string token = (Configuration.OneBotToken ?? "").Trim();
+
+        if (url.Length > 0)
+            return (url, token, "本插件");
+
+        // 按角色存，所以换角色读的是那个角色自己的 QQ 配置——不同角色可能是不同 bot 账号，这是对的。
+        // 第二条是兜底：StorageFolderPath 若已含角色层、或 StorageKey 为空，靠第一条拼不出来。
+        string[] candidates =
+        [
+            Path.Combine(AlifePath.StorageFolderPath, Character.StorageKey,
+                "Configuration", "Alife.Function.QChat.QChatService.json"),
+            Path.Combine(AlifePath.StorageFolderPath,
+                "Configuration", "Alife.Function.QChat.QChatService.json"),
+        ];
+
+        foreach (string path in candidates)
+        {
+            try
+            {
+                if (!File.Exists(path))
+                    continue;
+
+                using JsonDocument document = JsonDocument.Parse(File.ReadAllText(path));
+                string sharedUrl = document.RootElement.TryGetProperty("Url", out JsonElement u) ? u.GetString() ?? "" : "";
+                string sharedToken = document.RootElement.TryGetProperty("Token", out JsonElement t) ? t.GetString() ?? "" : "";
+                if (sharedUrl.Trim().Length > 0)
+                    return (sharedUrl.Trim(), token.Length > 0 ? token : sharedToken.Trim(), "QQ 聊天插件");
+            }
+            catch (Exception)
+            {
+                // 这个候选读不了就试下一个。配置坏了也不该让发卡失败在读取配置上
+            }
+        }
+
+        return ("ws://127.0.0.1:3001", token, "默认");
+    }
+
+    /// <summary>
+    /// 建连并鉴权。
+    /// token 必须在 ConnectAsync 之前写进请求头——连上之后 ClientWebSocket 不允许再改 Options。
+    /// </summary>
+    async Task ConnectOneBotAsync(ClientWebSocket connection, CancellationToken cancellationToken)
+    {
+        (string url, string token, _) = ResolveOneBot();
+        if (token.Length > 0)
+            connection.Options.SetRequestHeader("Authorization", "Bearer " + token);
+        await connection.ConnectAsync(new Uri(url), cancellationToken);
+    }
+
 
     static readonly HttpClient http = new(new HttpClientHandler {
         // 实测：B站这类站即使请求没带 Accept-Encoding 也照回 Content-Encoding: gzip，
@@ -121,6 +189,38 @@ public partial class ShareArkModule(
     static readonly Dictionary<string, string> _sfx = new();
     static bool _discovered; // 首页/openapi 路径发现只跑一次
     string KeyQ() => string.IsNullOrWhiteSpace(Configuration.ApiKey) ? "" : "key=" + Uri.EscapeDataString(Configuration.ApiKey) + "&";
+
+    // 签名端的成功码不统一：音乐卡是 code=200，分享卡文档写的是 code=0。
+    // 只认 200 的话，分享卡签名成功也会被当成失败——这是"分享卡突然用不了"最可能的成因之一。
+    static bool Ok(JsonElement root)
+        => root.ValueKind == JsonValueKind.Object
+           && root.TryGetProperty("code", out JsonElement code)
+           && code.ValueKind == JsonValueKind.Number
+           && code.GetInt32() is 200 or 0;
+
+    // 签名失败后短期内别再去试：服务端挂掉时每次点歌都要白等三四秒才降级。
+    // 状态放静态：几个模块实例共用一份，谁也不为别人的失败多等一次。
+    static DateTime signBlockedUntil = DateTime.MinValue;
+    static string signBlockedReason = "";
+
+    void MarkSignFailed(string reason)
+    {
+        int seconds = Math.Max(0, Configuration.SignFailureCooldownSeconds);
+        signBlockedReason = reason.Length > 40 ? reason[..40] : reason;
+        signBlockedUntil = seconds == 0 ? DateTime.MinValue : DateTime.Now.AddSeconds(seconds);
+    }
+
+    void MarkSignOk()
+    {
+        signBlockedUntil = DateTime.MinValue;
+        signBlockedReason = "";
+    }
+
+    void EnsureSignNotBlocked()
+    {
+        if (signBlockedUntil > DateTime.Now)
+            throw new Exception("第三方签名暂时不可用（" + signBlockedReason + "），先走备用方案");
+    }
     // 地址已带 ? 时用 & 接参数，支持手动地址自带 query
     static string WithQuery(string url, string query) => url.Contains('?') ? url + "&" + query : url + "?" + query;
     // 报错里附请求URL时把 key 打码
@@ -143,10 +243,8 @@ public partial class ShareArkModule(
                 using var r = await http.GetAsync(JoinUrl(Base(), c) + "?" + keyQ + probe, cts.Token);
                 string b = await r.Content.ReadAsStringAsync();
                 using var d = JsonDocument.Parse(b);
-                // 只认 code==200：错误路径回的 {code:404,msg:"API不存在"} 也带 code，一律不认
-                if (d.RootElement.ValueKind == JsonValueKind.Object
-                    && d.RootElement.TryGetProperty("code", out var c0)
-                    && c0.ValueKind == JsonValueKind.Number && c0.GetInt32() == 200)
+                // 只认成功码：错误路径回的 {code:404,msg:"API不存在"} 也带 code，一律不认
+                if (Ok(d.RootElement))
                 {
                     _sfx[key] = c;
                     return c;
@@ -287,14 +385,30 @@ public partial class ShareArkModule(
             {
                 using var r = await http.GetAsync(url);
                 string b = await r.Content.ReadAsStringAsync();
-                bool json = false;
+                // 以前只要返回体带 code 就算"通"——服务端回 code:500 也是带 code 的，
+                // 结果探测报告一片绿，实际一个也签不出来。
+                bool ok = false;
+                int code = -1;
+                string msg = "";
                 try
                 {
                     using var d = JsonDocument.Parse(b);
-                    json = d.RootElement.ValueKind == JsonValueKind.Object && d.RootElement.TryGetProperty("code", out _);
+                    if (d.RootElement.ValueKind == JsonValueKind.Object)
+                    {
+                        ok = Ok(d.RootElement);
+                        if (d.RootElement.TryGetProperty("code", out var c0) && c0.ValueKind == JsonValueKind.Number)
+                            code = c0.GetInt32();
+                        if (d.RootElement.TryGetProperty("msg", out var m0) && m0.ValueKind == JsonValueKind.String)
+                            msg = m0.GetString() ?? "";
+                    }
                 }
                 catch { }
-                rep.Add(name + "：" + (json ? "通" : "不通（返回不是签名接口结构 " + (int)r.StatusCode + "）"));
+                rep.Add(name + "：" + (ok
+                    ? "通"
+                    : "不通（HTTP " + (int)r.StatusCode
+                      + (code >= 0 ? "，code=" + code : "")
+                      + (msg.Length > 0 ? "，" + msg : "")
+                      + "）"));
             }
             catch (Exception ex) { rep.Add(name + "：不通（" + ex.Message + "）"); }
         }
@@ -483,7 +597,7 @@ public partial class ShareArkModule(
                 string u = WithQuery(Configuration.BiliSearchUrl.Trim(), KeyQ() + "msg=" + Uri.EscapeDataString(keyword));
                 string body = await http.GetStringAsync(u);
                 using var doc = JsonDocument.Parse(body);
-                if (doc.RootElement.GetProperty("code").GetInt32() != 200)
+                if (!Ok(doc.RootElement))
                     throw new Exception(doc.RootElement.TryGetProperty("msg", out var mm) ? mm.GetString() ?? "" : "搜索失败");
                 foreach (var v in doc.RootElement.GetProperty("data").EnumerateArray())
                 {
@@ -491,7 +605,13 @@ public partial class ShareArkModule(
                     string t = v.TryGetProperty("title", out var tv) ? Regex.Replace(tv.GetString() ?? "", "<[^>]*>", "") : "";
                     if (bv.Length > 0) list.Add((bv, t));
                 }
-                return list;
+                if (list.Count > 0)
+                    return list;
+                // 第三方回 200 但一条没有：继续走官方再搜一次。
+                // 否则"这家没搜到"会变成"全都没有"，而官方那边往往能搜着
+                if (Configuration.EnableOfficialFallback == false)
+                    throw new Exception("第三方 B站搜索没结果，官方回退又是关着的");
+                logger.LogInformation("B站第三方搜索没结果，转官方再试：" + keyword);
             }
             catch (Exception thirdPartyError)
             {
@@ -510,6 +630,17 @@ public partial class ShareArkModule(
         req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
         string obody = await (await http.SendAsync(req)).Content.ReadAsStringAsync();
         using var odoc = JsonDocument.Parse(obody);
+        // B站成功也是 code:0，和签名接口的 200 不一样；被风控时回 -412 且没有 data.result，
+        // 原来直接 GetProperty 会抛 KeyNotFoundException，报错里看不出是"被限流"还是"没搜到"
+        if (!odoc.RootElement.TryGetProperty("code", out var oc) || oc.GetInt32() != 0)
+        {
+            string om = odoc.RootElement.TryGetProperty("message", out var omm) ? omm.GetString() ?? "" : "";
+            throw new Exception("B站官方搜索失败（code=" + (odoc.RootElement.TryGetProperty("code", out var c1) ? c1.GetInt32().ToString() : "?")
+                + (om.Length > 0 ? "，" + om : "") + "）"
+                + (string.IsNullOrWhiteSpace(Configuration.BiliSearchUrl)
+                    ? "，可以在配置里填 BiliSearchUrl 走第三方搜索"
+                    : "（第三方搜索这次也没成功）"));
+        }
         foreach (var sec in odoc.RootElement.GetProperty("data").GetProperty("result").EnumerateArray())
         {
             if (sec.GetProperty("result_type").GetString() != "video") continue;
@@ -623,11 +754,28 @@ public partial class ShareArkModule(
             };
             if (!string.IsNullOrWhiteSpace(Configuration.ApiKey)) q["key"] = Configuration.ApiKey;
             string query = string.Join("&", q.Select(kv => Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value ?? "")));
+            EnsureSignNotBlocked();
             string full = WithQuery(shareUrl, query);
-            string body = await http.GetStringAsync(full);
+            string body;
+            try
+            {
+                body = await http.GetStringAsync(full);
+            }
+            catch (Exception ex)
+            {
+                MarkSignFailed(ex.Message);
+                logger.LogWarning("分享卡签名请求失败：{Msg} | {Url}", ex.Message, MaskKey(full));
+                throw new Exception("第三方签名连不上，先别发卡片");
+            }
             using var doc = JsonDocument.Parse(body);
-            if (doc.RootElement.GetProperty("code").GetInt32() != 200)
-                throw new Exception("签名失败：" + doc.RootElement.GetProperty("msg").GetString() + " | 请求=" + MaskKey(full));
+            if (!Ok(doc.RootElement))
+            {
+                string why = doc.RootElement.TryGetProperty("msg", out var m0) ? m0.GetString() ?? "" : "";
+                logger.LogWarning("分享卡签名失败：{Msg} | {Url}", why, MaskKey(full));
+                MarkSignFailed(why.Length > 0 ? why : "服务端无说明");
+                throw new Exception("第三方签名失败" + (why.Length > 0 ? "（" + why + "）" : ""));
+            }
+            MarkSignOk();
             string card = doc.RootElement.GetProperty("data").GetRawText();
             (bool Success, string Message) sent = await SendJsonAsync(target, isGroup, card);
             if (sent.Success) interactor.Poke("分享卡已发出");
@@ -636,8 +784,72 @@ public partial class ShareArkModule(
         catch (Exception ex)
         {
             logger.LogWarning("发分享卡失败：" + ex.Message);
-            interactor.Poke("发分享卡失败：" + ex.Message);
+            bool signProblem = ex.Message.Contains("签名", StringComparison.Ordinal);
+
+            // 签名挂了的时候退成一条普通图文消息：卡片是没有了，但链接和图还在，
+            // 群里看到的仍然是「标题 + 预览图 + 链接」，比一句"发卡片失败"有用。
+            if (signProblem && Configuration.EnableOfficialFallback)
+            {
+                (bool Success, string Message) plain =
+                    await SendLinkFallbackAsync(target, isGroup, title, desc, url, preview);
+                if (plain.Success)
+                {
+                    interactor.Poke("✅ 发出去了（卡片签名不可用，退成图文消息）");
+                    return;
+                }
+                interactor.Poke("❌ 分享卡没发成：签名（" + ex.Message + "）；图文兜底（" + plain.Message + "）");
+                return;
+            }
+
+            // B站链接被挡、网络抓取失败这类，不该假装发出去
+            string hint = signProblem ? "。这次没发成卡片，退一步直接把链接当普通文本发出去" : "";
+            interactor.Poke("发分享卡失败：" + ex.Message + hint);
         }
+    }
+
+    /// <summary>
+    /// 签名不可用时的退路：预览图 + 文字，图不成再退纯文字。
+    ///
+    /// 只降级、不假装：消息段发成功才算成功，返回体里没有 message_id 一律当失败
+    /// （LLOneBot 对不认识的消息段不报错，直接丢）。
+    /// </summary>
+    async Task<(bool Success, string Message)> SendLinkFallbackAsync(
+        long target, bool isGroup, string? title, string? desc, string url, string? preview)
+    {
+        string head = string.IsNullOrWhiteSpace(title) ? url : title.Trim();
+        if (head.Length > 60)
+            head = head[..60];
+
+        StringBuilder body = new();
+        body.Append('【').Append(head).Append('】');
+        string sub = (desc ?? "").Trim().Replace('\n', ' ');
+        if (sub.Length > 0 && sub != head)
+        {
+            if (sub.Length > 120)
+                sub = sub[..120] + "…";
+            body.Append('\n').Append(sub);
+        }
+        body.Append('\n').Append(url);
+
+        // 预览图只在是 http(s) 地址时带上：data: 那种协议端读不了，会把整条消息拖死
+        if (!string.IsNullOrWhiteSpace(preview) && preview.Trim().StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        {
+            JsonArray withImage = new()
+            {
+                new JsonObject { ["type"] = "image", ["data"] = new JsonObject { ["file"] = preview.Trim() } },
+                new JsonObject { ["type"] = "text", ["data"] = new JsonObject { ["text"] = body.ToString() } }
+            };
+            (bool Success, string Message) sent = await SendSegmentsAsync(target, isGroup, withImage);
+            if (sent.Success)
+                return sent;
+            logger.LogWarning("图文兜底失败，退纯文字：{Msg}", sent.Message);
+        }
+
+        JsonArray textOnly = new()
+        {
+            new JsonObject { ["type"] = "text", ["data"] = new JsonObject { ["text"] = body.ToString() } }
+        };
+        return await SendSegmentsAsync(target, isGroup, textOnly);
     }
 
     // ---------- B站系列（{BaseUrl}/bili-*，均需 ApiKey，文档见咸鱼API /series/bili） ----------
@@ -1709,15 +1921,26 @@ public partial class ShareArkModule(
         if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("singer"))) info["singer"] = "未知";
         if (!string.IsNullOrWhiteSpace(Configuration.ApiKey)) info["key"] = Configuration.ApiKey;
 
+        EnsureSignNotBlocked();
         for (int attempt = 0; ; attempt++)
         {
             string query = string.Join("&", info.Select(kv => Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value ?? "")));
             string fullUrl = WithQuery(MusicArkUrl(), query);
-            string body = await http.GetStringAsync(fullUrl);
-            using var doc = JsonDocument.Parse(body);
-            int code = doc.RootElement.GetProperty("code").GetInt32();
-            if (code == 200)
+            string body;
+            try
             {
+                body = await http.GetStringAsync(fullUrl);
+            }
+            catch (Exception ex)
+            {
+                MarkSignFailed(ex.Message);
+                logger.LogWarning("音乐卡签名请求失败：{Msg} | {Url}", ex.Message, MaskKey(fullUrl));
+                throw new Exception("第三方签名连不上，先走备用方案");
+            }
+            using var doc = JsonDocument.Parse(body);
+            if (Ok(doc.RootElement))
+            {
+                MarkSignOk();
                 JsonNode? node = JsonNode.Parse(doc.RootElement.GetProperty("data").GetRawText());
                 string songName = info["song"];
                 try { songName = node!["meta"]!["music"]!["title"]!.GetValue<string>(); } catch { }
@@ -1734,7 +1957,10 @@ public partial class ShareArkModule(
                 await EnsureFit();
                 continue;
             }
-            throw new Exception("签名失败：" + msg + " | 请求=" + MaskKey(fullUrl));
+            // 地址带 key，别把整条 URL 甩给模型看；日志里留一份给排查
+            logger.LogWarning("音乐卡签名失败：{Msg} | {Url}", string.IsNullOrWhiteSpace(msg) ? "（无说明）" : msg, MaskKey(fullUrl));
+            MarkSignFailed(msg.Length > 0 ? msg : "服务端无说明");
+            throw new Exception("第三方签名失败" + (msg.Length > 0 ? "（" + msg + "）" : ""));
         }
     }
 
@@ -1859,7 +2085,7 @@ public partial class ShareArkModule(
             _sharedWs?.Dispose();
             ClientWebSocket connection = new();
             using CancellationTokenSource connectTimeout = new(TimeSpan.FromSeconds(10));
-            await connection.ConnectAsync(new Uri(Configuration.WsUrl), connectTimeout.Token);
+            await ConnectOneBotAsync(connection, connectTimeout.Token);
             _sharedWs = connection;
         }
 
