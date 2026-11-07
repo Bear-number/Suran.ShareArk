@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
@@ -49,8 +50,8 @@ public partial class ShareArkModule
             else if (artist.Trim().Length > 0 && duration > 0)
             {
                 tries.Add("LRCLIB 精确");
-                lyric = ArkFreeSources.ParseLrclib(await GetJsonAsync(
-                    ArkFreeSources.LrclibGetUrl(artist.Trim(), song.Trim(), "", duration), "lrclib.net"), false);
+                lyric = ArkFreeSources.ParseLrclib(await GetLrclibAsync(
+                    ArkFreeSources.LrclibGetUrl(artist.Trim(), song.Trim(), "", duration)), false);
             }
             else
             {
@@ -60,7 +61,9 @@ public partial class ShareArkModule
                 {
                     throw new Exception("要给歌手+歌名，或者直接给网易云歌曲 id / 链接");
                 }
-                lyric = ArkFreeSources.ParseLrclib(await GetJsonAsync(ArkFreeSources.LrclibSearchUrl(keyword), "lrclib.net"), true);
+                // 搜索结果是模糊匹配，必须按歌手/歌名校验，别把翻唱或同名歌的歌词贴上去
+                lyric = ArkFreeSources.ParseLrclib(await GetLrclibAsync(
+                    ArkFreeSources.LrclibSearchUrl(keyword)), true, artist.Trim(), song.Trim());
             }
             string file = SaveLyric(string.Concat((artist.Trim() + "-" + song.Trim()).Select(c => char.IsLetterOrDigit(c) ? c : '_')), lyric);
             interactor.Poke(string.Join("\n", new[] {
@@ -138,29 +141,77 @@ public partial class ShareArkModule
     [Description("体检免费公开接口：LRCLIB 歌词（精确与搜索两种）、网易云官方歌词、iTunes、酷狗 v3、自抓 og 各打一次，逐项报可用性与原因")]
     public async Task ArkFreeProbe()
     {
+        // 六项互不依赖，并发打；串行时一个国际站超时会把整份体检拖到几十秒
+        Task<string>[] probes = new[]
+        {
+            TryJson(() => ArkFreeSources.LrclibSearchUrl("晴天 周杰伦"), "lrclib.net",
+                root => ArkFreeSources.ParseLrclib(root, true, "周杰伦", "晴天").Lines + " 行"),
+            TryJson(() => ArkFreeSources.LrclibGetUrl("周杰伦", "晴天", "叶惠美", 269), "lrclib.net",
+                root => ArkFreeSources.ParseLrclib(root, false).Lines + " 行"),
+            TryJson(() => ArkFreeSources.NeteaseLyricUrl("186013"), "music.163.com",
+                root => ArkFreeSources.ParseNeteaseLyric(root).Lines + " 行"),
+            TryJson(() => ArkFreeSources.ItunesSearchUrl("周杰伦 晴天"), "itunes.apple.com",
+                root => { List<ArkTrackInfo> list = ArkFreeSources.ParseItunes(root); return list.Count > 0 ? list[0].Describe() : "没结果"; }),
+            TryJson(() => "https://mobilecdn.kugou.com/api/v3/search/song?format=json&pagesize=3&keyword=" + Uri.EscapeDataString("晴天"), "mobilecdn.kugou.com",
+                root => root.TryGetProperty("data", out JsonElement data) && data.TryGetProperty("info", out JsonElement info) ? info.GetArrayLength() + " 条" : "结构不对"),
+            TryHtml()
+        };
+        await Task.WhenAll(probes);
         List<string> lines = new() { "免费公开接口体检（都不需要 key）：" };
-        lines.Add("· LRCLIB 歌词搜索：" + await TryJson(() => ArkFreeSources.LrclibSearchUrl("晴天 周杰伦"), "lrclib.net",
-            root => ArkFreeSources.ParseLrclib(root, true).Lines + " 行"));
-        lines.Add("· LRCLIB 精确取词：" + await TryJson(() => ArkFreeSources.LrclibGetUrl("周杰伦", "晴天", "叶惠美", 269), "lrclib.net",
-            root => ArkFreeSources.ParseLrclib(root, false).Lines + " 行"));
-        lines.Add("· 网易云官方歌词：" + await TryJson(() => ArkFreeSources.NeteaseLyricUrl("186013"), "music.163.com",
-            root => ArkFreeSources.ParseNeteaseLyric(root).Lines + " 行"));
-                lines.Add("· iTunes 搜索：" + await TryJson(() => ArkFreeSources.ItunesSearchUrl("周杰伦 晴天"), "itunes.apple.com",
-            root => { List<ArkTrackInfo> list = ArkFreeSources.ParseItunes(root); return list.Count > 0 ? list[0].Describe() : "没结果"; }));
-        lines.Add("· 酷狗 v3（本插件容灾链里的一环）：" + await TryJson(() => "https://mobilecdn.kugou.com/api/v3/search/song?format=json&pagesize=3&keyword=" + Uri.EscapeDataString("晴天"), "mobilecdn.kugou.com",
-            root => root.TryGetProperty("data", out JsonElement data) && data.TryGetProperty("info", out JsonElement info) ? info.GetArrayLength() + " 条" : "结构不对"));
+        lines.Add("· LRCLIB 歌词搜索：" + probes[0].Result);
+        lines.Add("· LRCLIB 精确取词：" + probes[1].Result);
+        lines.Add("· 网易云官方歌词：" + probes[2].Result);
+        lines.Add("· iTunes 搜索：" + probes[3].Result);
+        lines.Add("· 酷狗 v3（本插件容灾链里的一环）：" + probes[4].Result);
         lines.Add(Configuration.EnableMicrolink ? "· microlink：已允许兜底（会把查询的链接交给外部服务）" : "· microlink：默认不用（开了才会把链接交给外部解析）");
-        lines.Add("自抓 og：" + await TryHtml());
+        lines.Add("自抓 og：" + probes[5].Result);
         interactor.Poke(string.Join("\n", lines));
     }
 
     bool FreeGuard() => Gate(Configuration.EnableFreeSources, "免费公开接口");
+    static readonly ConcurrentDictionary<string, (DateTime At, string Body)> FreeBodyCache = new();
+    const int FreeBodyCacheMax = 50;
+
     async Task<JsonElement> GetJsonAsync(string url, string host)
     {
-        string body = await GetStringAsync(url, host);
-        using JsonDocument doc = JsonDocument.Parse(body);
-        return doc.RootElement.Clone();
+        return ParseJsonBody(await GetStringAsync(url, host));
     }
+
+    /// <summary>歌词查询会重复打同一组接口（同一首歌反复点），缓存 30 分钟；只缓存成功响应</summary>
+    async Task<JsonElement> GetLrclibAsync(string url)
+    {
+        TimeSpan ttl = TimeSpan.FromMinutes(30);
+        if (FreeBodyCache.TryGetValue(url, out (DateTime At, string Body) hit) && DateTime.Now - hit.At < ttl)
+        {
+            return ParseJsonBody(hit.Body);
+        }
+        string body = await GetStringAsync(url, "lrclib.net");
+        if (FreeBodyCache.Count >= FreeBodyCacheMax)
+        {
+            // 简单清一批最老的，别让缓存无限长
+            foreach (string stale in FreeBodyCache.Keys.Take(FreeBodyCache.Count - FreeBodyCacheMax + 1).ToList())
+            {
+                FreeBodyCache.TryRemove(stale, out _);
+            }
+        }
+        FreeBodyCache[url] = (DateTime.Now, body);
+        return ParseJsonBody(body);
+    }
+
+    static JsonElement ParseJsonBody(string body)
+    {
+        try
+        {
+            using JsonDocument doc = JsonDocument.Parse(body);
+            return doc.RootElement.Clone();
+        }
+        catch (JsonException)
+        {
+            string sample = ArkFreeSources.SafeText(body, 80);
+            throw new Exception("返回不是有效 JSON（前 80 字：" + sample + "），可能被风控页或限流拦截");
+        }
+    }
+
     async Task<string> GetHtmlAsync(string url)
     {
         string host = new Uri(url).Host.ToLowerInvariant();
@@ -169,23 +220,13 @@ public partial class ShareArkModule
     }
     async Task<string> GetStringAsync(string url, string host)
     {
-        using HttpRequestMessage request = new(HttpMethod.Get, url);
-        request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
-        if (FreeReferers.TryGetValue(host, out string? referer))
-        {
-            request.Headers.TryAddWithoutValidation("Referer", referer);
-        }
-        using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(Math.Clamp(Configuration.FreeSourceTimeoutSeconds, 3, 90)));
-        using HttpResponseMessage response = await http.SendAsync(request, timeout.Token);
-        // 有些站（实测网易云）回 Content-Type: text/html; charset=UTF-8，.NET 认不下这个大写 charset，
-        // ReadAsStringAsync 会直接抛异常；按字节读回来自己解码就不受它摆布
-        byte[] bytes = await response.Content.ReadAsByteArrayAsync(timeout.Token);
-        string body = Encoding.UTF8.GetString(bytes);
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new Exception("HTTP " + (int)response.StatusCode + "（" + new Uri(url).Host + "）");
-        }
-        return body;
+        TimeSpan timeout = TimeSpan.FromSeconds(Math.Clamp(Configuration.FreeSourceTimeoutSeconds, 3, 90));
+        string? referer = FreeReferers.TryGetValue(host, out string? known) ? known : null;
+        // 统一走 SafeFetchAsync：4MB 上限、逐跳校验重定向、拒绝二进制响应。
+        // 按响应头/页面 meta 的 charset 解码：有些站回 text/html; charset=UTF-8（大写），
+        // .NET 认不下；GBK 的站一律按 UTF-8 解会整页乱码
+        FetchResult result = await SafeFetchAsync(url, referer, timeout, false);
+        return DecodeBody(result.Bytes, result.ContentType);
     }
     async Task<string> TryJson(Func<string> url, string host, Func<JsonElement, string> read)
     {
@@ -221,8 +262,16 @@ public partial class ShareArkModule
             {
                 safe = "lyric";
             }
+            // 歌名+歌手不设上限时会撞文件名长度限制；留 80 字足够区分
+            if (safe.Length > 80)
+            {
+                safe = safe[..80];
+            }
             string path = Path.Combine(folder, safe + ".lrc");
-            File.WriteAllText(path, lyric.Lyrics, Encoding.UTF8);
+            // 先写临时文件再原子替换：写到一半断电/崩溃不会把上一份好歌词毁掉
+            string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            File.WriteAllText(temp, lyric.Lyrics, Encoding.UTF8);
+            File.Move(temp, path, true);
             return path;
         }
         catch (Exception)

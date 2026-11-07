@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
@@ -6,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
@@ -63,6 +65,39 @@ public class ShareArkConfig
     [Description("第三方接口失败时是否自动改用官方接口。")]
     public bool EnableOfficialFallback { get; set; } = true;
 
+    [DisplayName("容灾·备用签名基地址")]
+    [Description("主站失败后按顺序尝试。多个用逗号或换行分隔；每个可写成 base|key（key 留空则沿用上面的 ApiKey）。"
+        + "适合再填一家同协议（qq-musicArk / qq-shareArk / *-music-search）的签名站。")]
+    public string BackupBaseUrls { get; set; } = "";
+
+    [DisplayName("容灾·启用公共音乐卡签名")]
+    [Description("主站与备用站都失败时，音乐卡再试 OIAPI 公共签名（免 key，实测可用）。分享卡没有公共备用，仍走图文兜底。")]
+    public bool EnableBuiltinMusicSign { get; set; } = true;
+
+    [DisplayName("容灾·公共音乐卡签名地址")]
+    [Description("默认 OIAPI 的 QQMusicJSONArk 接口；换服务时只改这一行。")]
+    public string BuiltinMusicArkUrl { get; set; } = "https://oiapi.net/api/QQMusicJSONArk";
+
+    [DisplayName("容灾·额外音乐卡签名地址")]
+    [Description("完整地址，一行一个，可写 url|key。适合 OIAPI 风格的第三方音乐卡签名（GET，参数 url/song/singer/cover/jump/format，format 用 163，成功码 0/200/1 都认）。")]
+    public string ExtraMusicSignUrls { get; set; } = "";
+
+    [DisplayName("容灾·额外分享卡签名地址")]
+    [Description("完整地址，一行一个，可写 url|key。用于路径不标准的第三方分享卡签名（GET，参数 title/desc/url/preview/prompt，成功码 0/200）。")]
+    public string ExtraShareSignUrls { get; set; } = "";
+
+    [DisplayName("容灾·启用公共音乐平台接口")]
+    [Description("免费、无需注册：洛苏API（网易云/QQ/酷狗点歌，详情带直链与封面）与糖豆子API（QQ 搜索）。官方音乐接口失败时自动补位。")]
+    public bool EnablePublicMusicApis { get; set; } = true;
+
+    [DisplayName("容灾·洛苏API基地址")]
+    [Description("免费公共点歌接口，默认 https://api.luosu.top；换镜像只改这里。")]
+    public string LuoSuBaseUrl { get; set; } = "https://api.luosu.top";
+
+    [DisplayName("容灾·糖豆子API基地址")]
+    [Description("免费公共 QQ 音乐搜索接口，默认 https://api.tangdouz.com；换镜像只改这里。")]
+    public string TangDouZiBaseUrl { get; set; } = "https://api.tangdouz.com";
+
     // ── 功能开关：关闭后对应函数对AI不可用（默认全开，老配置缺省即开） ──
     [DisplayName("开关·搜歌")] [Description("关闭后 SearchMusic 不可用")]
     public bool EnableSearchMusic { get; set; } = true;
@@ -96,7 +131,7 @@ public class ShareArkConfig
 
 [Module("QQ分享卡片",
     "自己完成音乐卡与通用分享卡签名并直塞协议端，不依赖协议端的签名地址配置",
-    defaultCategory: "苏染的工具",
+    defaultCategory: "苏染的工具/媒体与分享",
     EditorUI = typeof(ShareArkUI))]
 public partial class ShareArkModule(
     XmlFunctionCaller functionCaller,
@@ -172,6 +207,249 @@ public partial class ShareArkModule(
         AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
     }) { Timeout = TimeSpan.FromSeconds(20) };
 
+    // 抓用户给的链接必须自己校验每一跳：默认的自动重定向会顺着 302 一路跳进内网，
+    // 而 .NET 没有"禁止私有地址"的开关。这个客户端只用于这类抓取，别影响签名/B站那些正常请求
+    static readonly HttpClient safeHttp = new(new HttpClientHandler {
+        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
+        AllowAutoRedirect = false
+        // 超时交给每次请求自己的 CTS：这里的 Timeout 会盖掉调用方给的 3~90 秒配置
+    }) { Timeout = Timeout.InfiniteTimeSpan };
+
+    const long SafeFetchMaxBytes = 4 * 1024 * 1024;
+    const int SafeFetchMaxHops = 4;
+
+    sealed record FetchResult(byte[] Bytes, string ContentType);
+
+    /// <summary>
+    /// 用户可控链接的取数入口：只放行 http/https 公网地址，逐跳校验重定向，
+    /// 响应按字节限流（4MB），明显是二进制的响应直接拒掉。
+    /// page=true 时还要求返回网页/JSON，避免把图片当页面塞进 meta 解析。
+    /// 网络层失败（连不上/被重置）重试一次；被安全策略拒掉的不重试。
+    /// </summary>
+    static async Task<FetchResult> SafeFetchAsync(string url, string? referer, TimeSpan timeout, bool page)
+    {
+        Exception? lastError = null;
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                return await SafeFetchOnceAsync(url, referer, timeout, page);
+            }
+            catch (Exception e) when (attempt == 0 && IsTransientFetchError(e))
+            {
+                lastError = e;
+            }
+        }
+        throw lastError ?? new Exception("抓取失败");
+    }
+
+    static bool IsTransientFetchError(Exception error)
+        => error is HttpRequestException || error is IOException || error is SocketException;
+
+    static async Task<FetchResult> SafeFetchOnceAsync(string url, string? referer, TimeSpan timeout, bool page)
+    {
+        Uri current = await VerifyPublicUriAsync(url);
+        using CancellationTokenSource cts = new(timeout);
+        for (int hop = 0; hop <= SafeFetchMaxHops; hop++)
+        {
+            using HttpRequestMessage request = new(HttpMethod.Get, current);
+            request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
+            if (!string.IsNullOrEmpty(referer))
+            {
+                request.Headers.TryAddWithoutValidation("Referer", referer);
+            }
+            using HttpResponseMessage response = await safeHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            if ((int)response.StatusCode is >= 300 and <= 399)
+            {
+                Uri? location = response.Headers.Location;
+                if (location == null)
+                {
+                    throw new Exception("重定向没给目标地址（HTTP " + (int)response.StatusCode + "）");
+                }
+                Uri next = location.IsAbsoluteUri ? location : new Uri(current, location);
+                current = await VerifyPublicUriAsync(next.AbsoluteUri);
+                continue;
+            }
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new Exception("HTTP " + (int)response.StatusCode + "（" + current.Host + "）");
+            }
+
+            string media = response.Content.Headers.ContentType?.MediaType ?? "";
+            if (media.Length > 0 && (media.StartsWith("image/", StringComparison.OrdinalIgnoreCase)
+                || media.StartsWith("audio/", StringComparison.OrdinalIgnoreCase)
+                || media.StartsWith("video/", StringComparison.OrdinalIgnoreCase)
+                || media.Contains("octet-stream", StringComparison.OrdinalIgnoreCase)
+                || media.Contains("pdf", StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new Exception("返回的不是网页/JSON（" + media + "），已中止");
+            }
+            if (page && media.Length > 0
+                && !media.StartsWith("text/", StringComparison.OrdinalIgnoreCase)
+                && !media.Contains("html", StringComparison.OrdinalIgnoreCase)
+                && !media.Contains("json", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception("返回类型不是网页（" + media + "），已中止");
+            }
+
+            long? declared = response.Content.Headers.ContentLength;
+            if (declared.HasValue && declared.Value > SafeFetchMaxBytes)
+            {
+                throw new Exception("响应过大（" + declared.Value + " 字节 > 4MB），已中止");
+            }
+
+            using Stream stream = await response.Content.ReadAsStreamAsync(cts.Token);
+            using MemoryStream buffer = new();
+            byte[] chunk = new byte[8192];
+            int read;
+            while ((read = await stream.ReadAsync(chunk.AsMemory(0, chunk.Length), cts.Token)) > 0)
+            {
+                if (buffer.Length + read > SafeFetchMaxBytes)
+                {
+                    throw new Exception("响应超过 4MB 上限，已中止（目标可能不是普通网页）");
+                }
+                buffer.Write(chunk, 0, read);
+            }
+            return new FetchResult(buffer.ToArray(), response.Content.Headers.ContentType?.ToString() ?? "");
+        }
+        throw new Exception("重定向次数超过 " + SafeFetchMaxHops + " 次，已中止");
+    }
+
+    static readonly Regex CharsetPattern = new("charset\\s*=\\s*[\"']?([^;\"'\\s]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    static bool codePagesRegistered;
+
+    /// <summary>
+    /// 按响应头/页面 meta 里的 charset 解码，读不到才退回 UTF-8。
+    /// 原来一律按 UTF-8 硬解，GBK 的站会整页乱码，网易云那种大写 charset 还会被 .NET 直接拒。
+    /// </summary>
+    static string DecodeBody(byte[] bytes, string? contentType)
+    {
+        if (bytes.Length == 0)
+        {
+            return "";
+        }
+        if (codePagesRegistered == false)
+        {
+            codePagesRegistered = true;
+            try { Encoding.RegisterProvider(CodePagesEncodingProvider.Instance); } catch { }
+        }
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+        {
+            return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
+        }
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+        {
+            return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
+        }
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+        {
+            return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
+        }
+
+        string charset = CharsetPattern.Match(contentType ?? "").Groups[1].Value;
+        if (charset.Length == 0)
+        {
+            // 响应头没写就翻页面开头的 meta，只扫前 1KB，避免把整页按 ASCII 再解一遍
+            string head = Encoding.ASCII.GetString(bytes, 0, Math.Min(bytes.Length, 1024));
+            charset = CharsetPattern.Match(head).Groups[1].Value;
+        }
+        if (charset.Length > 0)
+        {
+            try
+            {
+                return Encoding.GetEncoding(charset.Trim().Trim('"', '\'')).GetString(bytes);
+            }
+            catch
+            {
+                // 名字认不出来就按 UTF-8
+            }
+        }
+        return Encoding.UTF8.GetString(bytes);
+    }
+
+    /// <summary>
+    /// 只允许公网 http/https。域名先解析再逐个查网段：光看字符串挡不住
+    /// 127.0.0.1 的变形写法，也挡不住内网域名解析结果。
+    /// </summary>
+    static async Task<Uri> VerifyPublicUriAsync(string raw)
+    {
+        if (!Uri.TryCreate((raw ?? "").Trim(), UriKind.Absolute, out Uri? uri))
+        {
+            throw new Exception("给个完整链接（要带 https://）");
+        }
+        if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+        {
+            throw new Exception("只允许 http/https 链接（" + uri.Scheme + " 不支持）");
+        }
+        string host = uri.Host.Trim('[', ']');
+        if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+            || host.EndsWith(".local", StringComparison.OrdinalIgnoreCase)
+            || host.EndsWith(".internal", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new Exception("这个地址指向内网（" + host + "），已拒绝");
+        }
+        IPAddress[] addresses;
+        if (IPAddress.TryParse(host, out IPAddress? literal))
+        {
+            addresses = new[] { literal };
+        }
+        else
+        {
+            try
+            {
+                addresses = await Dns.GetHostAddressesAsync(host);
+            }
+            catch (Exception e)
+            {
+                throw new Exception("域名解析失败（" + host + "）：" + e.Message);
+            }
+        }
+        if (addresses.Length == 0)
+        {
+            throw new Exception("域名解析不到地址（" + host + "）");
+        }
+        foreach (IPAddress address in addresses)
+        {
+            if (IsPrivateAddress(address))
+            {
+                throw new Exception("目标地址在内网/回环范围（" + host + "），已拒绝（SSRF 防护）");
+            }
+        }
+        return uri;
+    }
+
+    static bool IsPrivateAddress(IPAddress address)
+    {
+        if (address.IsIPv4MappedToIPv6)
+        {
+            address = address.MapToIPv4();
+        }
+        if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any))
+        {
+            return true;
+        }
+        byte[] b = address.GetAddressBytes();
+        if (address.AddressFamily == AddressFamily.InterNetwork)
+        {
+            return b[0] == 0 || b[0] == 10 || b[0] == 127
+                || (b[0] == 100 && b[1] >= 64 && b[1] <= 127)      // 运营商级 NAT
+                || (b[0] == 169 && b[1] == 254)                    // 链路本地
+                || (b[0] == 172 && b[1] >= 16 && b[1] <= 31)
+                || (b[0] == 192 && b[1] == 168)
+                || (b[0] == 192 && b[1] == 0 && b[2] == 0)         // 192.0.0.0/24 特殊用途
+                || (b[0] == 198 && (b[1] == 18 || b[1] == 19))     // 基准测试
+                || b[0] >= 224;                                    // 组播/保留
+        }
+        if (address.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            return address.Equals(IPAddress.IPv6Loopback)
+                || (b[0] & 0xFE) == 0xFC                            // fc00::/7 唯一本地
+                || (b[0] == 0xFE && (b[1] & 0xC0) == 0x80)          // fe80::/10 链路本地
+                || b[0] == 0xFF;                                    // 组播
+        }
+        return true; // 其它地址族一律不放行
+    }
+
     // 由基地址推导三个接口地址，填一个基地址就能用全部功能
     string Base()
     {
@@ -188,7 +466,8 @@ public partial class ShareArkModule(
     };
     static readonly Dictionary<string, string> _sfx = new();
     static bool _discovered; // 首页/openapi 路径发现只跑一次
-    string KeyQ() => string.IsNullOrWhiteSpace(Configuration.ApiKey) ? "" : "key=" + Uri.EscapeDataString(Configuration.ApiKey) + "&";
+    string KeyQ() => KeyQ(Configuration.ApiKey);
+    static string KeyQ(string? apiKey) => string.IsNullOrWhiteSpace(apiKey) ? "" : "key=" + Uri.EscapeDataString(apiKey) + "&";
 
     // 签名端的成功码不统一：音乐卡是 code=200，分享卡文档写的是 code=0。
     // 只认 200 的话，分享卡签名成功也会被当成失败——这是"分享卡突然用不了"最可能的成因之一。
@@ -198,55 +477,248 @@ public partial class ShareArkModule(
            && code.ValueKind == JsonValueKind.Number
            && code.GetInt32() is 200 or 0;
 
-    // 签名失败后短期内别再去试：服务端挂掉时每次点歌都要白等三四秒才降级。
-    // 状态放静态：几个模块实例共用一份，谁也不为别人的失败多等一次。
-    static DateTime signBlockedUntil = DateTime.MinValue;
-    static string signBlockedReason = "";
+    // ---- 多节点容灾：主站、用户填的备用站、内置公共音乐卡签名各自独立冷却 ----
+    sealed record SignProvider(string Name, string BaseUrl, string ApiKey);
+    sealed record SignNode(string Name, string Url, string ApiKey, bool Builtin, bool Primary, string BaseUrl);
 
-    void MarkSignFailed(string reason)
+    static readonly Dictionary<string, string> _sfxBackup = new(); // key = 规范化base|role
+    static readonly ConcurrentDictionary<string, (DateTime Until, string Reason)> NodeCooldowns = new();
+
+    static string NormBase(string url) => (url ?? "").Trim().TrimEnd('/');
+
+    static IEnumerable<string> SplitConfigList(string raw)
+    {
+        foreach (string line in (raw ?? "").Replace("\r", "").Split('\n'))
+        {
+            foreach (string part in line.Split(new[] { ',', '，', ';', '；' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (part.Length > 0)
+                {
+                    yield return part;
+                }
+            }
+        }
+    }
+
+    List<SignProvider> Providers()
+    {
+        List<SignProvider> list = new();
+        bool primary = !string.IsNullOrWhiteSpace(Configuration.BaseUrl)
+            || !string.IsNullOrWhiteSpace(Configuration.MusicArkUrl)
+            || !string.IsNullOrWhiteSpace(Configuration.ShareArkUrl)
+            || !string.IsNullOrWhiteSpace(Configuration.SearchUrl);
+        if (primary)
+        {
+            list.Add(new SignProvider("主站", NormBase(Configuration.BaseUrl), (Configuration.ApiKey ?? "").Trim()));
+        }
+        int index = 0;
+        foreach (string raw in SplitConfigList(Configuration.BackupBaseUrls))
+        {
+            string[] parts = raw.Split('|', 2);
+            string url = NormBase(parts[0]);
+            if (url.Length == 0)
+            {
+                continue;
+            }
+            index++;
+            string key = parts.Length > 1 ? parts[1].Trim() : (Configuration.ApiKey ?? "").Trim();
+            list.Add(new SignProvider("备用" + index, url, key));
+        }
+        return list;
+    }
+
+    static string SfxOf(string baseUrl, string role)
+    {
+        string cacheKey = NormBase(baseUrl) + "|" + role;
+        if (_sfxBackup.TryGetValue(cacheKey, out string cached))
+        {
+            return cached;
+        }
+        return _cands.TryGetValue(role, out string[] cands) && cands.Length > 0 ? cands[0] : role;
+    }
+
+    async Task EnsureFitOnBaseAsync(SignProvider provider, string role)
+    {
+        if (provider.BaseUrl.Length == 0)
+        {
+            return;
+        }
+        string cacheKey = provider.BaseUrl + "|" + role;
+        if (_sfxBackup.ContainsKey(cacheKey))
+        {
+            return;
+        }
+        string[] cands = _cands.TryGetValue(role, out string[] known) ? known : new[] { role };
+        await Fit(role, cands, ProbeOf(role), provider.BaseUrl, provider.ApiKey);
+    }
+
+    async Task<string> NodeUrlAsync(SignProvider provider, string role)
+    {
+        // 主站允许用「完整地址」手动覆盖；备用站一律按 base + 识别到的后缀拼
+        if (provider.Name == "主站")
+        {
+            if (role == "ark" && !string.IsNullOrWhiteSpace(Configuration.MusicArkUrl))
+            {
+                return Configuration.MusicArkUrl.Trim();
+            }
+            if (role == "share" && !string.IsNullOrWhiteSpace(Configuration.ShareArkUrl))
+            {
+                return Configuration.ShareArkUrl.Trim();
+            }
+            if (role.StartsWith("s-", StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(Configuration.SearchUrl))
+            {
+                return Configuration.SearchUrl.Trim().Replace("{pf}", role[2..]);
+            }
+            if (provider.BaseUrl.Length == 0)
+            {
+                return "";
+            }
+            if (_sfx.ContainsKey(role) == false)
+            {
+                await EnsureFit();
+            }
+            return JoinUrl(provider.BaseUrl, SfxOf(provider.BaseUrl, role));
+        }
+        if (provider.BaseUrl.Length == 0)
+        {
+            return "";
+        }
+        await EnsureFitOnBaseAsync(provider, role);
+        return JoinUrl(provider.BaseUrl, SfxOf(provider.BaseUrl, role));
+    }
+
+    static IEnumerable<(string Name, string Url, string Key)> ExtraNodes(string raw, string label)
+    {
+        int index = 0;
+        foreach (string line in SplitConfigList(raw))
+        {
+            string[] parts = line.Split('|', 2);
+            string url = parts[0].Trim();
+            if (url.StartsWith("http", StringComparison.OrdinalIgnoreCase) == false)
+            {
+                continue;
+            }
+            index++;
+            yield return (label + index, url, parts.Length > 1 ? parts[1].Trim() : "");
+        }
+    }
+
+    async Task<List<SignNode>> MusicNodesAsync()
+    {
+        List<SignNode> nodes = new();
+        foreach (SignProvider provider in Providers())
+        {
+            string url = await NodeUrlAsync(provider, "ark");
+            if (url.Length > 0)
+            {
+                nodes.Add(new SignNode(provider.Name + "·音乐卡", url, provider.ApiKey, false, provider.Name == "主站", provider.BaseUrl));
+            }
+        }
+        // 额外完整地址：按 OIAPI/公共签名那套参数发，成功码 0/200/1 都认，data 形状也做兼容
+        foreach ((string name, string url, string key) in ExtraNodes(Configuration.ExtraMusicSignUrls, "额外音乐卡"))
+        {
+            nodes.Add(new SignNode(name, url, key, true, false, ""));
+        }
+        if (Configuration.EnableBuiltinMusicSign && !string.IsNullOrWhiteSpace(Configuration.BuiltinMusicArkUrl))
+        {
+            nodes.Add(new SignNode("OIAPI·公共音乐卡", Configuration.BuiltinMusicArkUrl.Trim(), "", true, false, ""));
+        }
+        return nodes;
+    }
+
+    async Task<List<SignNode>> ShareNodesAsync()
+    {
+        List<SignNode> nodes = new();
+        foreach (SignProvider provider in Providers())
+        {
+            string url = await NodeUrlAsync(provider, "share");
+            if (url.Length > 0)
+            {
+                nodes.Add(new SignNode(provider.Name + "·分享卡", url, provider.ApiKey, false, provider.Name == "主站", provider.BaseUrl));
+            }
+        }
+        foreach ((string name, string url, string key) in ExtraNodes(Configuration.ExtraShareSignUrls, "额外分享卡"))
+        {
+            nodes.Add(new SignNode(name, url, key, false, false, ""));
+        }
+        return nodes;
+    }
+
+    async Task<List<SignNode>> SearchNodesAsync(string pf)
+    {
+        List<SignNode> nodes = new();
+        foreach (SignProvider provider in Providers())
+        {
+            string url = await NodeUrlAsync(provider, "s-" + pf);
+            if (url.Length > 0)
+            {
+                nodes.Add(new SignNode(provider.Name + "·搜索", url, provider.ApiKey, false, provider.Name == "主站", provider.BaseUrl));
+            }
+        }
+        return nodes;
+    }
+
+    string? NodeBlocked(string url)
+    {
+        if (NodeCooldowns.TryGetValue(NodeKey(url), out (DateTime Until, string Reason) hit) && hit.Until > DateTime.Now)
+        {
+            int left = (int)Math.Ceiling((hit.Until - DateTime.Now).TotalSeconds);
+            return "冷却中（" + hit.Reason + "），" + left + " 秒后重试";
+        }
+        return null;
+    }
+
+    void MarkSignFailed(string url, string reason)
     {
         int seconds = Math.Max(0, Configuration.SignFailureCooldownSeconds);
-        signBlockedReason = reason.Length > 40 ? reason[..40] : reason;
-        signBlockedUntil = seconds == 0 ? DateTime.MinValue : DateTime.Now.AddSeconds(seconds);
+        string shortReason = reason.Length > 40 ? reason[..40] : reason;
+        NodeCooldowns[NodeKey(url)] = seconds == 0
+            ? (DateTime.MinValue, shortReason)
+            : (DateTime.Now.AddSeconds(seconds), shortReason);
     }
 
-    void MarkSignOk()
-    {
-        signBlockedUntil = DateTime.MinValue;
-        signBlockedReason = "";
-    }
-
-    void EnsureSignNotBlocked()
-    {
-        if (signBlockedUntil > DateTime.Now)
-            throw new Exception("第三方签名暂时不可用（" + signBlockedReason + "），先走备用方案");
-    }
+    void MarkSignOk(string url) => NodeCooldowns.TryRemove(NodeKey(url), out _);
     // 地址已带 ? 时用 & 接参数，支持手动地址自带 query
     static string WithQuery(string url, string query) => url.Contains('?') ? url + "&" + query : url + "?" + query;
     // 报错里附请求URL时把 key 打码
     static string MaskKey(string url) => Regex.Replace(url, "([?&]key=)[^&]+", "$1***", RegexOptions.IgnoreCase);
+    static string NodeKey(string url) => MaskKey(url);
     // 候选可以是后缀也可以是完整地址（自动发现的文档链接可能带全路径）
     static string JoinUrl(string b, string c) => c.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? c : b + "/" + c;
-    string MusicArkUrl() => !string.IsNullOrWhiteSpace(Configuration.MusicArkUrl) ? Configuration.MusicArkUrl.Trim() : JoinUrl(Base(), _sfx.TryGetValue("ark", out var a) ? a : "qq-musicArk");
-    string ShareArkUrl() => !string.IsNullOrWhiteSpace(Configuration.ShareArkUrl) ? Configuration.ShareArkUrl.Trim() : JoinUrl(Base(), _sfx.TryGetValue("share", out var s) ? s : "qq-shareArk");
-    string SearchUrl(string pf) => !string.IsNullOrWhiteSpace(Configuration.SearchUrl) ? Configuration.SearchUrl.Trim().Replace("{pf}", pf) : JoinUrl(Base(), _sfx.TryGetValue("s-" + pf, out var q) ? q : pf + "-music-search");
+    string BaseOrEmpty() => string.IsNullOrWhiteSpace(Configuration.BaseUrl) ? "" : Base();
+    string MusicArkUrl() => !string.IsNullOrWhiteSpace(Configuration.MusicArkUrl) ? Configuration.MusicArkUrl.Trim()
+        : BaseOrEmpty().Length > 0 ? JoinUrl(BaseOrEmpty(), _sfx.TryGetValue("ark", out var a) ? a : "qq-musicArk") : "";
+    string ShareArkUrl() => !string.IsNullOrWhiteSpace(Configuration.ShareArkUrl) ? Configuration.ShareArkUrl.Trim()
+        : BaseOrEmpty().Length > 0 ? JoinUrl(BaseOrEmpty(), _sfx.TryGetValue("share", out var s) ? s : "qq-shareArk") : "";
+    string SearchUrl(string pf) => !string.IsNullOrWhiteSpace(Configuration.SearchUrl) ? Configuration.SearchUrl.Trim().Replace("{pf}", pf)
+        : BaseOrEmpty().Length > 0 ? JoinUrl(BaseOrEmpty(), _sfx.TryGetValue("s-" + pf, out var q) ? q : pf + "-music-search") : "";
 
-    // 填一个基地址就够：默认后缀不通就挨个试候选，试通的记住
-    async Task<string?> Fit(string key, string[] cands, string probe)
+    // 填一个基地址就够：默认后缀不通就挨个试候选，试通的记住（主站写进 _sfx，备用站写进 _sfxBackup）
+    async Task<string?> Fit(string key, string[] cands, string probe, string baseUrl = "", string? apiKey = null)
     {
-        string keyQ = KeyQ();
+        string norm = NormBase(baseUrl.Length > 0 ? baseUrl : Configuration.BaseUrl);
+        if (norm.Length == 0)
+        {
+            return null;
+        }
+        string keyQ = KeyQ(apiKey ?? Configuration.ApiKey);
         foreach (var c in cands)
         {
             try
             {
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                using var r = await http.GetAsync(JoinUrl(Base(), c) + "?" + keyQ + probe, cts.Token);
+                using var r = await http.GetAsync(JoinUrl(norm, c) + "?" + keyQ + probe, cts.Token);
                 string b = await r.Content.ReadAsStringAsync();
                 using var d = JsonDocument.Parse(b);
                 // 只认成功码：错误路径回的 {code:404,msg:"API不存在"} 也带 code，一律不认
                 if (Ok(d.RootElement))
                 {
-                    _sfx[key] = c;
+                    string cacheKey = norm + "|" + key;
+                    _sfxBackup[cacheKey] = c;
+                    if (norm == NormBase(Configuration.BaseUrl))
+                    {
+                        _sfx[key] = c;
+                    }
                     return c;
                 }
             }
@@ -279,6 +751,8 @@ public partial class ShareArkModule(
     // 首次用到才适配：先试内置候选，缺的角色再去首页/openapi 挖一圈路径补试
     async Task EnsureFit()
     {
+        // 只填了手动完整地址、没填基地址时，不需要（也不应该）自动探测
+        if (string.IsNullOrWhiteSpace(Configuration.BaseUrl)) return;
         foreach (var kv in _cands)
             if (!Manual(kv.Key) && !_sfx.ContainsKey(kv.Key))
                 await Fit(kv.Key, kv.Value, ProbeOf(kv.Key));
@@ -378,7 +852,11 @@ public partial class ShareArkModule(
     // 探测三个接口，返回报告文本（UI 按钮与 AI 函数共用）
     public async Task<string> ProbeBaseReportAsync()
     {
-        var rep = new List<string> { string.IsNullOrWhiteSpace(Configuration.BaseUrl) ? "基地址未填，只用手动地址" : "基地址 " + Base() };
+        var rep = new List<string> {
+            string.IsNullOrWhiteSpace(Configuration.BaseUrl)
+                ? (SplitConfigList(Configuration.BackupBaseUrls).Any() ? "基地址未填，使用备用节点" : "基地址未填，只用手动地址")
+                : "基地址 " + Base()
+        };
         async Task Probe(string name, string url)
         {
             try
@@ -417,12 +895,121 @@ public partial class ShareArkModule(
         rep.Add(UrlLine("音乐卡", Configuration.MusicArkUrl, "ark"));
         rep.Add(UrlLine("分享卡", Configuration.ShareArkUrl, "share"));
         rep.Add(UrlLine("歌曲搜索", Configuration.SearchUrl, "s-163"));
-        await Probe("歌曲搜索", WithQuery(SearchUrl("163"), keyQ + "msg=" + Uri.EscapeDataString("test")));
-        await Probe("音乐卡", WithQuery(MusicArkUrl(), keyQ + "platform=163&id=1"));
-        await Probe("分享卡", WithQuery(ShareArkUrl(), keyQ + "title=t&desc=t&url=https%3A%2F%2Fexample.com&preview=https%3A%2F%2Fexample.com%2Fa.jpg&prompt=t"));
+        string searchUrl = SearchUrl("163");
+        if (searchUrl.Length > 0)
+        {
+            await Probe("歌曲搜索", WithQuery(searchUrl, keyQ + "msg=" + Uri.EscapeDataString("test")));
+        }
+        else
+        {
+            rep.Add("歌曲搜索：未配置地址");
+        }
+        string musicUrl = MusicArkUrl();
+        if (musicUrl.Length > 0)
+        {
+            await Probe("音乐卡", WithQuery(musicUrl, keyQ + ProbeOf("ark")));
+        }
+        else
+        {
+            rep.Add("音乐卡：未配置地址");
+        }
+        string shareUrl = ShareArkUrl();
+        if (shareUrl.Length > 0)
+        {
+            await Probe("分享卡", WithQuery(shareUrl, keyQ + ProbeOf("share")));
+        }
+        else
+        {
+            rep.Add("分享卡：未配置地址");
+        }
         if (!string.IsNullOrWhiteSpace(Configuration.BiliSearchUrl))
             await Probe("B站搜索", WithQuery(Configuration.BiliSearchUrl.Trim(), keyQ + "msg=" + Uri.EscapeDataString("test")));
+
+        // 多节点容灾：按实际调用顺序把每个节点都打一次，主站挂了能一眼看出备用站是否可用
+        rep.Add("容灾节点（按调用顺序）：");
+        foreach (SignNode node in await MusicNodesAsync())
+        {
+            rep.Add("  " + await ProbeNodeAsync(node, ProbeOf("ark"), node.Builtin));
+        }
+        foreach (SignNode node in await ShareNodesAsync())
+        {
+            rep.Add("  " + await ProbeNodeAsync(node, ProbeOf("share"), false));
+        }
+        foreach (SignNode node in await SearchNodesAsync("163"))
+        {
+            rep.Add("  " + await ProbeNodeAsync(node, "msg=test", false));
+        }
+        rep.Add("公共音乐平台：" + await ProbePublicMusicAsync());
         return string.Join("\n", rep);
+    }
+
+    // 单个容灾节点的体检：成功码规则和签名节点保持一致（OIAPI 认 1）
+    async Task<string> ProbeNodeAsync(SignNode node, string probe, bool builtin)
+    {
+        string? cooling = NodeBlocked(node.Url);
+        if (cooling != null)
+        {
+            return node.Name + "：" + cooling;
+        }
+        try
+        {
+            string effectiveProbe = builtin ? probe.Replace("format=netease", "format=163") : probe;
+            using HttpResponseMessage response = await http.GetAsync(WithQuery(node.Url, KeyQ(node.ApiKey) + effectiveProbe));
+            string body = await response.Content.ReadAsStringAsync();
+            using JsonDocument doc = JsonDocument.Parse(body);
+            JsonElement root = doc.RootElement;
+            bool ok = root.ValueKind == JsonValueKind.Object
+                && root.TryGetProperty("code", out JsonElement code)
+                && code.ValueKind == JsonValueKind.Number
+                && (builtin ? code.GetInt32() is 1 or 200 or 0 : code.GetInt32() is 200 or 0);
+            return node.Name + "：" + (ok
+                ? "通"
+                : "不通（HTTP " + (int)response.StatusCode
+                  + (ReadCode(root) >= 0 ? "，code=" + ReadCode(root) : "")
+                  + (ReadMsg(root).Length > 0 ? "，" + ReadMsg(root) : "") + "）")
+                + " · " + MaskKey(node.Url);
+        }
+        catch (Exception probeError)
+        {
+            return node.Name + "：不通（" + probeError.Message + "）· " + MaskKey(node.Url);
+        }
+    }
+
+    // 公共音乐平台接口体检：洛苏（网易云/QQ/酷狗点歌）与糖豆子（QQ 搜索）
+    async Task<string> ProbePublicMusicAsync()
+    {
+        List<string> parts = new();
+        if (Configuration.EnablePublicMusicApis == false)
+        {
+            return "未启用（容灾·启用公共音乐平台接口 是关的）";
+        }
+        try
+        {
+            string url = WithQuery((Configuration.LuoSuBaseUrl ?? "").Trim().TrimEnd('/') + "/api/qqmusic/",
+                "ss=" + Uri.EscapeDataString("晴天") + "&format=json&t=2");
+            string body = await http.GetStringAsync(url);
+            using JsonDocument doc = JsonDocument.Parse(body);
+            bool ok = doc.RootElement.ValueKind == JsonValueKind.Object && ReadCode(doc.RootElement) == 200;
+            parts.Add("洛苏 QQ " + (ok ? "通" : "不通（code=" + ReadCode(doc.RootElement) + "）"));
+        }
+        catch (Exception error)
+        {
+            parts.Add("洛苏 QQ 不通（" + error.Message + "）");
+        }
+        try
+        {
+            string url = WithQuery((Configuration.TangDouZiBaseUrl ?? "").Trim().TrimEnd('/') + "/a/qqmusic.php",
+                "nr=" + Uri.EscapeDataString("晴天") + "&return=json");
+            string body = await http.GetStringAsync(url);
+            using JsonDocument doc = JsonDocument.Parse(body);
+            parts.Add("糖豆子 QQ " + (doc.RootElement.ValueKind == JsonValueKind.Array && doc.RootElement.GetArrayLength() > 0
+                ? "通" : "回空"));
+        }
+        catch (Exception error)
+        {
+            parts.Add("糖豆子 QQ 不通（" + error.Message + "）");
+        }
+        return string.Join("；", parts);
     }
 
     // 报告每个接口最终用的地址来源：手动填的报地址，自动的报试通的后缀
@@ -540,14 +1127,7 @@ public partial class ShareArkModule(
         {
             if (pf != "163" && pf != "qq" && pf != "kugou")
                 throw new Exception("搜索只支持 163/qq/kugou");
-            await EnsureFit();
-            string keyQ = KeyQ();
-            string u = WithQuery(SearchUrl(pf), keyQ + "msg=" + Uri.EscapeDataString(keyword));
-            string body = await http.GetStringAsync(u);
-            using var doc = JsonDocument.Parse(body);
-            if (doc.RootElement.GetProperty("code").GetInt32() != 200)
-                throw new Exception(doc.RootElement.TryGetProperty("msg", out var mm) ? mm.GetString() : "搜索失败");
-            var arr = doc.RootElement.GetProperty("data");
+            JsonElement arr = await SearchRawAsync(pf, keyword);
             List<string> lines = new();
             int n = 0;
             foreach (var s0 in arr.EnumerateArray())
@@ -568,6 +1148,12 @@ public partial class ShareArkModule(
         {
             if (Configuration.EnableOfficialFallback == false)
             {
+                string? publicLines = await PublicMusicSearchLinesAsync(pf, keyword);
+                if (publicLines != null)
+                {
+                    interactor.Poke("ℹ️ 第三方接口不可用（" + thirdPartyError.Message + "），已用公共音乐接口。\n" + publicLines);
+                    return;
+                }
                 interactor.Poke("搜索失败：" + thirdPartyError.Message);
                 return;
             }
@@ -580,11 +1166,62 @@ public partial class ShareArkModule(
             }
             catch (Exception officialError)
             {
+                string? publicLines = await PublicMusicSearchLinesAsync(pf, keyword);
+                if (publicLines != null)
+                {
+                    interactor.Poke("ℹ️ 第三方与官方都不可用，已切公共音乐接口（第三方：" + thirdPartyError.Message
+                        + "；官方：" + officialError.Message + "）。\n" + publicLines);
+                    return;
+                }
                 interactor.Poke("❌ 搜索：第三方（" + thirdPartyError.Message + "）；官方容灾（" + officialError.Message + "）");
             }
         }
     }
 
+
+    // 搜歌多节点：主站 → 备用站；返回签名端 data 数组
+    async Task<JsonElement> SearchRawAsync(string pf, string keyword)
+        => await SearchDataAsync(pf, "msg=" + Uri.EscapeDataString(keyword));
+
+    // 搜索类接口共用：queryPart 可以是 msg=...（搜索）或 id=...（酷狗详情）
+    async Task<JsonElement> SearchDataAsync(string pf, string queryPart)
+    {
+        List<SignNode> nodes = await SearchNodesAsync(pf);
+        if (nodes.Count == 0)
+        {
+            throw new Exception("搜索节点一个都没配置：先填第三方接口基地址，或填备用签名基地址");
+        }
+        List<string> errors = new();
+        foreach (SignNode node in nodes)
+        {
+            string? cooling = NodeBlocked(node.Url);
+            if (cooling != null)
+            {
+                errors.Add(node.Name + "：" + cooling);
+                continue;
+            }
+            try
+            {
+                string u = WithQuery(node.Url, KeyQ(node.ApiKey) + queryPart);
+                string body = await http.GetStringAsync(u);
+                using JsonDocument doc = JsonDocument.Parse(body);
+                if (Ok(doc.RootElement) == false)
+                {
+                    throw new Exception("接口回 code=" + ReadCode(doc.RootElement) + "：" + ReadMsg(doc.RootElement));
+                }
+                JsonElement data = doc.RootElement.GetProperty("data").Clone();
+                MarkSignOk(node.Url);
+                return data;
+            }
+            catch (Exception nodeError)
+            {
+                MarkSignFailed(node.Url, nodeError.Message);
+                errors.Add(node.Name + "：" + nodeError.Message);
+                logger.LogWarning("搜索节点 {Node} 失败：{Msg}", node.Name, nodeError.Message);
+            }
+        }
+        throw new Exception("所有搜索节点都失败（" + string.Join("；", errors) + "）");
+    }
 
     // B站视频搜索统一入口：配置了第三方接口优先走第三方（失败按容灾配置转官方），否则走B站官方，都归一成 (BV号, 标题) 列表
     async Task<List<(string bv, string title)>> BiliSearchAsync(string keyword)
@@ -727,14 +1364,16 @@ public partial class ShareArkModule(
         bool isGroup = !string.Equals(type, "private", StringComparison.OrdinalIgnoreCase);
         try
         {
+            // 链接是用户给的：先确认是公网 http/https，再往下抓页面/发卡
+            await VerifyPublicUriAsync(url);
             // 过滤B站链接：B站走专用搜索+音乐卡接口，不走通用分享卡
-            await EnsureFit();
             string host = "";
             try { host = new Uri(url).Host.ToLowerInvariant(); } catch { }
                 if ((host.Contains("bilibili.com") || host.Contains("b23.tv") || host.Contains("biligame.com")) && !host.StartsWith("live."))
                     throw new Exception("B站视频/主页链接不走自定义卡，用 SearchBili 拿BV号再 SendArkCard，或用 BiliParse 解析这个链接，直播可直接发");
 
-            var meta = await FetchMetaAsync(url);
+            // 免费源开关关掉后，发卡就不能再偷偷抓页面：只用调用方给的标题/描述/预览
+            var meta = Configuration.EnableFreeSources ? await FetchMetaAsync(url) : new PageMeta();
             if (preview != null && preview.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) preview = null; // data URI 不收，回落自动抓
             if (string.IsNullOrWhiteSpace(title)) title = meta.title;
             if (string.IsNullOrWhiteSpace(desc)) desc = meta.desc;
@@ -743,40 +1382,8 @@ public partial class ShareArkModule(
             if (string.IsNullOrWhiteSpace(desc)) desc = title;
             if (string.IsNullOrWhiteSpace(prompt))
                 prompt = "[分享]" + title;
-            string shareUrl = ShareArkUrl();
-            var q = new Dictionary<string, string>
-            {
-                ["title"] = title,
-                ["desc"] = desc,
-                ["preview"] = preview,
-                ["url"] = url,
-                ["prompt"] = prompt
-            };
-            if (!string.IsNullOrWhiteSpace(Configuration.ApiKey)) q["key"] = Configuration.ApiKey;
-            string query = string.Join("&", q.Select(kv => Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value ?? "")));
-            EnsureSignNotBlocked();
-            string full = WithQuery(shareUrl, query);
-            string body;
-            try
-            {
-                body = await http.GetStringAsync(full);
-            }
-            catch (Exception ex)
-            {
-                MarkSignFailed(ex.Message);
-                logger.LogWarning("分享卡签名请求失败：{Msg} | {Url}", ex.Message, MaskKey(full));
-                throw new Exception("第三方签名连不上，先别发卡片");
-            }
-            using var doc = JsonDocument.Parse(body);
-            if (!Ok(doc.RootElement))
-            {
-                string why = doc.RootElement.TryGetProperty("msg", out var m0) ? m0.GetString() ?? "" : "";
-                logger.LogWarning("分享卡签名失败：{Msg} | {Url}", why, MaskKey(full));
-                MarkSignFailed(why.Length > 0 ? why : "服务端无说明");
-                throw new Exception("第三方签名失败" + (why.Length > 0 ? "（" + why + "）" : ""));
-            }
-            MarkSignOk();
-            string card = doc.RootElement.GetProperty("data").GetRawText();
+            // 依次尝试主站 / 备用站；全失败才抛给下面的图文兜底
+            string card = await SignShareCardAsync(title, desc, url, preview, prompt);
             (bool Success, string Message) sent = await SendJsonAsync(target, isGroup, card);
             if (sent.Success) interactor.Poke("分享卡已发出");
             else interactor.Poke("❌ 分享卡没发出去：" + sent.Message);
@@ -805,6 +1412,86 @@ public partial class ShareArkModule(
             string hint = signProblem ? "。这次没发成卡片，退一步直接把链接当普通文本发出去" : "";
             interactor.Poke("发分享卡失败：" + ex.Message + hint);
         }
+    }
+
+    // 分享卡多节点签名：主站 → 备用站；某个节点失败只冷却自己，不影响后面的节点
+    async Task<string> SignShareCardAsync(string title, string? desc, string url, string? preview, string? prompt)
+    {
+        Dictionary<string, string> parameters = new()
+        {
+            ["title"] = title,
+            ["desc"] = desc ?? "",
+            ["preview"] = preview ?? "",
+            ["url"] = url,
+            ["prompt"] = prompt ?? "",
+        };
+        List<SignNode> nodes = await ShareNodesAsync();
+        if (nodes.Count == 0)
+        {
+            throw new Exception("签名节点一个都没配置：先填第三方接口基地址，或填备用签名基地址");
+        }
+        List<string> errors = new();
+        foreach (SignNode node in nodes)
+        {
+            string? cooling = NodeBlocked(node.Url);
+            if (cooling != null)
+            {
+                errors.Add(node.Name + "：" + cooling);
+                continue;
+            }
+            try
+            {
+                string card = await SignShareOnNodeAsync(node, parameters);
+                MarkSignOk(node.Url);
+                return card;
+            }
+            catch (Exception nodeError)
+            {
+                MarkSignFailed(node.Url, nodeError.Message);
+                errors.Add(node.Name + "：" + nodeError.Message);
+                logger.LogWarning("分享卡节点 {Node} 失败：{Msg}", node.Name, nodeError.Message);
+            }
+        }
+        throw new Exception("所有分享卡签名节点都失败（" + string.Join("；", errors) + "）");
+    }
+
+    async Task<string> SignShareOnNodeAsync(SignNode node, Dictionary<string, string> parameters)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            Dictionary<string, string> q = new(parameters);
+            if (!string.IsNullOrWhiteSpace(node.ApiKey))
+            {
+                q["key"] = node.ApiKey;
+            }
+            string query = string.Join("&", q.Select(kv => Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value ?? "")));
+            string full = WithQuery(node.Url, query);
+            string body;
+            try
+            {
+                body = await http.GetStringAsync(full);
+            }
+            catch (Exception requestError)
+            {
+                throw new Exception("连不上：" + requestError.Message);
+            }
+            using JsonDocument doc = JsonDocument.Parse(body);
+            if (Ok(doc.RootElement))
+            {
+                return CardJsonFrom(doc.RootElement.GetProperty("data"));
+            }
+            string msg = ReadMsg(doc.RootElement);
+            // 缓存的接口后缀失效（服务端报 API 不存在）：清掉该节点缓存重探一次
+            if (attempt == 0 && msg.Contains("不存在") && node.BaseUrl.Length > 0)
+            {
+                await RefitAsync(node.BaseUrl, "share", node.ApiKey);
+                node = node with { Url = JoinUrl(node.BaseUrl, SfxOf(node.BaseUrl, "share")) };
+                continue;
+            }
+            logger.LogWarning("分享卡节点 {Node} 签名失败：{Msg} | {Url}", node.Name, msg, MaskKey(full));
+            throw new Exception("接口回 code=" + ReadCode(doc.RootElement) + (msg.Length > 0 ? "：" + msg : ""));
+        }
+        throw new Exception("重试后仍失败");
     }
 
     /// <summary>
@@ -857,16 +1544,57 @@ public partial class ShareArkModule(
     // 第三方接口统一调用（B站系列/IP查询等，均在 {BaseUrl} 下）：拼 key 参数，code!=200 时抛出 msg
     async Task<JsonElement> ApiCall(string path, params (string k, string? v)[] ps)
     {
-        if (string.IsNullOrWhiteSpace(Configuration.ApiKey))
+        List<SignProvider> providers = Providers().Where(provider => provider.BaseUrl.Length > 0).ToList();
+        if (providers.Count == 0)
+        {
+            throw new Exception("B站系列接口需要第三方基地址，去模块配置里补上");
+        }
+        if (providers.All(provider => provider.ApiKey.Length == 0))
+        {
             throw new Exception("B站系列接口需要 ApiKey，去模块配置里补上");
-        var q = new List<string> { "key=" + Uri.EscapeDataString(Configuration.ApiKey) };
-        foreach (var (k, v) in ps)
-            if (!string.IsNullOrWhiteSpace(v)) q.Add(Uri.EscapeDataString(k) + "=" + Uri.EscapeDataString(v));
-        string body = await http.GetStringAsync(WithQuery(Base() + "/" + path, string.Join("&", q)));
-        using var doc = JsonDocument.Parse(body);
-        if (doc.RootElement.GetProperty("code").GetInt32() != 200)
-            throw new Exception(doc.RootElement.TryGetProperty("msg", out var m) ? m.GetString() ?? "" : "调用失败");
-        return doc.RootElement.GetProperty("data").Clone();
+        }
+        List<string> errors = new();
+        foreach (SignProvider provider in providers)
+        {
+            string url = provider.BaseUrl + "/" + path;
+            string? cooling = NodeBlocked(url);
+            if (cooling != null)
+            {
+                errors.Add(provider.Name + "：" + cooling);
+                continue;
+            }
+            List<string> q = new();
+            if (!string.IsNullOrWhiteSpace(provider.ApiKey))
+            {
+                q.Add("key=" + Uri.EscapeDataString(provider.ApiKey));
+            }
+            foreach (var (k, v) in ps)
+            {
+                if (!string.IsNullOrWhiteSpace(v))
+                {
+                    q.Add(Uri.EscapeDataString(k) + "=" + Uri.EscapeDataString(v));
+                }
+            }
+            try
+            {
+                string body = await http.GetStringAsync(WithQuery(url, string.Join("&", q)));
+                using JsonDocument doc = JsonDocument.Parse(body);
+                if (ReadCode(doc.RootElement) != 200)
+                {
+                    throw new Exception(ReadMsg(doc.RootElement) is string m && m.Length > 0 ? m : "调用失败");
+                }
+                JsonElement data = doc.RootElement.GetProperty("data").Clone();
+                MarkSignOk(url);
+                return data;
+            }
+            catch (Exception nodeError)
+            {
+                MarkSignFailed(url, nodeError.Message);
+                errors.Add(provider.Name + "：" + nodeError.Message);
+                logger.LogWarning("第三方接口 {Path} 在 {Node} 失败：{Msg}", path, provider.Name, nodeError.Message);
+            }
+        }
+        throw new Exception("所有第三方节点都失败（" + string.Join("；", errors) + "）");
     }
 
     // 字段取值兼容字符串和数字
@@ -1720,16 +2448,15 @@ public partial class ShareArkModule(
         var m = new PageMeta();
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
-            // 页面抓取只给8秒：国外站连不上时别拖满20秒全局超时
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
-            // 按字节读回来自己解码：有些站回 charset=UTF-8（大写），ReadAsStringAsync 会直接抛
-            using HttpResponseMessage page = await http.SendAsync(req, cts.Token);
-            string html = Encoding.UTF8.GetString(await page.Content.ReadAsByteArrayAsync(cts.Token));
-            m.title = Meta(html, "og:title") ?? Meta(html, "twitter:title") ?? "";
-            m.desc = Meta(html, "og:description") ?? Meta(html, "description") ?? "";
-            m.image = Meta(html, "og:image") ?? Meta(html, "twitter:image") ?? "";
+            // 页面抓取只给8秒：国外站连不上时别拖满20秒全局超时。
+            // 走 SafeFetchAsync：链接是用户给的，必须逐跳校验重定向和内网地址
+            FetchResult page = await SafeFetchAsync(url, null, TimeSpan.FromSeconds(8), true);
+            string html = DecodeBody(page.Bytes, page.ContentType);
+            // 和 ArkLinkMeta 共用同一套 meta 解析，避免两处正则各写一份、修一处漏一处
+            ArkLinkInfo meta = ArkFreeSources.ParseOpenGraph(html, url);
+            m.title = meta.Title;
+            m.desc = meta.Description;
+            m.image = meta.Image;
             if (string.IsNullOrWhiteSpace(m.image))
             {
                 Match lm = Regex.Match(html, "<link[^>]+rel=[\"'][^\"']*icon[^\"']*[\"'][^>]*?href=[\"']([^\"']+)[\"']", RegexOptions.IgnoreCase);
@@ -1739,8 +2466,6 @@ public partial class ShareArkModule(
                     try { m.image = new Uri(new Uri(url), lm.Groups[1].Value).ToString(); } catch { }
                 }
             }
-            if (string.IsNullOrWhiteSpace(m.title))
-                m.title = Regex.Match(html, @"<title[^>]*>(.*?)</title>", RegexOptions.Singleline | RegexOptions.IgnoreCase).Groups[1].Value.Trim();
         }
         catch (Exception ex) { logger.LogWarning("抓网页meta失败：" + ex.Message); }
         // 页面抓不到（超时/被墙）也必须给非空预览：签名端空值当缺参，直接用站点favicon
@@ -1751,32 +2476,285 @@ public partial class ShareArkModule(
         return m;
     }
 
-    static string Meta(string html, string prop)
-    {
-        var p = Regex.Escape(prop);
-        var a = Regex.Match(html, @"<meta[^>]+(?:property|name)=[""']" + p + @"[""'][^>]+content=[""']([^""']*)", RegexOptions.IgnoreCase);
-        if (a.Success) return a.Groups[1].Value;
-        var b = Regex.Match(html, @"<meta[^>]+content=[""']([^""']*)[""'][^>]+(?:property|name)=[""']" + p + @"[""']", RegexOptions.IgnoreCase);
-        return b.Success ? b.Groups[1].Value : "";
-    }
-
-    // 传歌名不是ID时统一走搜索接口拿第一条，不再各平台手写一遍自带API
+    // 传歌名不是ID时统一走搜索接口拿第一条：先试第三方多节点，全失败再走官方搜索
     async Task<(string id, string title, string author, string cover)> SearchFirstAsync(string pf, string kw)
     {
-        string keyQ = KeyQ();
-        string u = WithQuery(SearchUrl(pf), keyQ + "msg=" + Uri.EscapeDataString(kw));
-        string body = await http.GetStringAsync(u);
-        using var doc = JsonDocument.Parse(body);
-        if (doc.RootElement.GetProperty("code").GetInt32() != 200)
-            throw new Exception("搜索失败");
-        var d = doc.RootElement.GetProperty("data")[0];
-        string G(string k) => d.TryGetProperty(k, out var v) ? (v.GetString() ?? "") : "";
-        return (G("id"), G("title"), G("author"), G("cover"));
+        try
+        {
+            JsonElement data = await SearchRawAsync(pf, kw);
+            if (data.ValueKind != JsonValueKind.Array || data.GetArrayLength() == 0)
+            {
+                throw new Exception("搜索没结果：" + kw);
+            }
+            JsonElement d = data[0];
+            string G(string k) => d.TryGetProperty(k, out var v) ? (v.GetString() ?? "") : "";
+            return (G("id"), G("title"), G("author"), G("cover"));
+        }
+        catch (Exception thirdPartyError)
+        {
+            // 第三方搜索全挂时，用官方搜索兜住；官方没有封面字段，后面详情接口会补
+            List<(string Id, string Name, string Singer)> official = await OfficialSearchAsync(pf, kw);
+            if (official.Count == 0)
+            {
+                throw new Exception("搜索没结果（第三方：" + thirdPartyError.Message + "；官方也没搜到）");
+            }
+            (string Id, string Name, string Singer) first = official[0];
+            return (first.Id, first.Name, first.Singer, "");
+        }
+    }
+
+    // 详情接口的第三方兜底：用第三方搜索端的 id= 参数再问一次（不同平台返回形状不一，做宽松映射）
+    async Task<Dictionary<string, string>?> SearchDetailFallbackAsync(string pf, string id, string format, string jump, string playUrl)
+    {
+        try
+        {
+            JsonElement data = await SearchDataAsync(pf, "id=" + Uri.EscapeDataString(id));
+            JsonElement d = data;
+            if (d.ValueKind == JsonValueKind.Array)
+            {
+                if (d.GetArrayLength() == 0)
+                {
+                    return null;
+                }
+                d = d[0];
+            }
+            if (d.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+            string title = Field(d, "title", "song", "name");
+            string singer = Field(d, "author", "singer", "artist");
+            string cover = Field(d, "cover", "pic", "picUrl", "img");
+            string url = Field(d, "url", "play_url", "music_url");
+            string link = Field(d, "link", "jump", "jump_url");
+            if (title.Length == 0 || singer.Length == 0)
+            {
+                return null;
+            }
+            return new Dictionary<string, string>
+            {
+                ["song"] = title,
+                ["singer"] = singer,
+                ["cover"] = cover,
+                ["format"] = format,
+                ["url"] = url.Length > 0 ? url : playUrl,
+                ["jump"] = link.Length > 0 ? link : jump,
+            };
+        }
+        catch (Exception fallbackError)
+        {
+            logger.LogWarning("详情第三方兜底失败（{Platform} {Id}）：{Msg}", pf, id, fallbackError.Message);
+            return null;
+        }
+    }
+
+    static string Field(JsonElement element, params string[] names)
+    {
+        foreach (string name in names)
+        {
+            if (element.TryGetProperty(name, out JsonElement value))
+            {
+                if (value.ValueKind == JsonValueKind.String)
+                {
+                    string text = value.GetString() ?? "";
+                    if (text.Length > 0)
+                    {
+                        return text;
+                    }
+                }
+                else if (value.ValueKind == JsonValueKind.Number)
+                {
+                    return value.GetRawText();
+                }
+            }
+        }
+        return "";
+    }
+
+    // ---- 公共音乐平台容灾：洛苏API（点歌详情）/ 糖豆子API（QQ 搜索） ----
+
+    static string LuoSuPath(string platform)
+    {
+        return platform switch
+        {
+            "163" => "/api/wymusic/",
+            "qq" => "/api/qqmusic/",
+            "kugou" => "/api/kgmusic/",
+            _ => "",
+        };
+    }
+
+    // 洛苏点歌：一次请求就能拿到歌名/歌手/封面/播放直链，适合按歌名解析详情
+    async Task<Dictionary<string, string>?> LuoSuSongAsync(string platform, string keyword, int index = 1)
+    {
+        if (Configuration.EnablePublicMusicApis == false)
+        {
+            return null;
+        }
+        string path = LuoSuPath(platform);
+        if (path.Length == 0 || (keyword ?? "").Trim().Length == 0)
+        {
+            return null;
+        }
+        try
+        {
+            string baseUrl = (Configuration.LuoSuBaseUrl ?? "").Trim().TrimEnd('/');
+            if (baseUrl.Length == 0)
+            {
+                return null;
+            }
+            string url = WithQuery(baseUrl + path,
+                "ss=" + Uri.EscapeDataString(keyword.Trim())
+                + "&n=" + Math.Max(1, index).ToString(CultureInfo.InvariantCulture)
+                + "&format=json");
+            string body = await http.GetStringAsync(url);
+            using JsonDocument doc = JsonDocument.Parse(body);
+            JsonElement root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object || ReadCode(root) != 200)
+            {
+                return null;
+            }
+            JsonElement data = root.GetProperty("data");
+            if (data.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+            string song = Field(data, "name");
+            string singer = Field(data, "singer");
+            string cover = Field(data, "cover_url");
+            string play = Field(data, "play_url");
+            string id = platform == "qq" ? Field(data, "songmid", "id")
+                : platform == "kugou" ? Field(data, "songmid", "hash", "id")
+                : Field(data, "id", "songmid");
+            string jump;
+            if (platform == "163")
+            {
+                jump = "https://music.163.com/song?id=" + id;
+            }
+            else if (platform == "qq")
+            {
+                jump = "https://y.qq.com/n/ryqq/songDetail/" + id;
+            }
+            else
+            {
+                jump = "https://www.kugou.com/song/#hash=" + id;
+            }
+            if (song.Length == 0 || singer.Length == 0)
+            {
+                return null;
+            }
+            return new Dictionary<string, string>
+            {
+                ["song"] = song,
+                ["singer"] = singer,
+                ["cover"] = cover,
+                ["format"] = platform == "163" ? "netease" : platform,
+                ["url"] = play.Length > 0 ? play : jump,
+                ["jump"] = jump,
+            };
+        }
+        catch (Exception luosuError)
+        {
+            logger.LogWarning("洛苏API 点歌失败（{Platform} {Keyword}）：{Msg}", platform, keyword, luosuError.Message);
+            return null;
+        }
+    }
+
+    // 搜歌兜底：洛苏列表 + 糖豆子（QQ），返回可直接展示的行
+    async Task<string?> PublicMusicSearchLinesAsync(string pf, string keyword)
+    {
+        if (Configuration.EnablePublicMusicApis == false)
+        {
+            return null;
+        }
+        try
+        {
+            string path = LuoSuPath(pf);
+            string baseUrl = (Configuration.LuoSuBaseUrl ?? "").Trim().TrimEnd('/');
+            if (path.Length > 0 && baseUrl.Length > 0)
+            {
+                string url = WithQuery(baseUrl + path,
+                    "ss=" + Uri.EscapeDataString(keyword) + "&format=json&t=5");
+                string body = await http.GetStringAsync(url);
+                using JsonDocument doc = JsonDocument.Parse(body);
+                JsonElement root = doc.RootElement;
+                if (root.ValueKind == JsonValueKind.Object && ReadCode(root) == 200)
+                {
+                    JsonElement songs = JsonValueOrDefault(root, "data", "songs");
+                    if (songs.ValueKind == JsonValueKind.Array && songs.GetArrayLength() > 0)
+                    {
+                        List<string> lines = new() { "洛苏API：" };
+                        foreach (JsonElement song in songs.EnumerateArray())
+                        {
+                            lines.Add(Field(song, "index") + " | " + Field(song, "name")
+                                + " - " + Field(song, "artists"));
+                        }
+                        return string.Join("\n", lines);
+                    }
+                }
+            }
+        }
+        catch (Exception luosuError)
+        {
+            logger.LogWarning("洛苏API 搜歌失败：{Msg}", luosuError.Message);
+        }
+        if (pf == "qq")
+        {
+            try
+            {
+                string baseUrl = (Configuration.TangDouZiBaseUrl ?? "").Trim().TrimEnd('/');
+                if (baseUrl.Length > 0)
+                {
+                    string url = WithQuery(baseUrl + "/a/qqmusic.php",
+                        "nr=" + Uri.EscapeDataString(keyword) + "&return=json");
+                    string body = await http.GetStringAsync(url);
+                    using JsonDocument doc = JsonDocument.Parse(body);
+                    JsonElement root = doc.RootElement;
+                    if (root.ValueKind == JsonValueKind.Array && root.GetArrayLength() > 0)
+                    {
+                        List<string> lines = new() { "糖豆子API：" };
+                        int count = 0;
+                        foreach (JsonElement song in root.EnumerateArray())
+                        {
+                            if (count++ >= 5)
+                            {
+                                break;
+                            }
+                            string share = Field(song, "share");
+                            Match idMatch = Regex.Match(share, @"songid=(\d+)");
+                            lines.Add((idMatch.Success ? idMatch.Groups[1].Value : "?")
+                                + " | " + Field(song, "name") + " - " + Field(song, "singer"));
+                        }
+                        return string.Join("\n", lines);
+                    }
+                }
+            }
+            catch (Exception tangError)
+            {
+                logger.LogWarning("糖豆子API 搜歌失败：{Msg}", tangError.Message);
+            }
+        }
+        return null;
+    }
+
+    static JsonElement JsonValueOrDefault(JsonElement root, params string[] path)
+    {
+        JsonElement current = root;
+        foreach (string key in path)
+        {
+            if (current.ValueKind != JsonValueKind.Object || current.TryGetProperty(key, out JsonElement next) == false)
+            {
+                return JsonDocument.Parse("null").RootElement.Clone();
+            }
+            current = next;
+        }
+        return current;
     }
 
     async Task<Dictionary<string, string>> ResolveInfoAsync(string platform, string id, string? title)
     {
         var info = new Dictionary<string, string>();
+        string original = (id ?? "").Trim();
         platform = (platform ?? "163").Trim().ToLowerInvariant();
         if (platform == "163")
         {
@@ -1798,7 +2776,26 @@ public partial class ShareArkModule(
                 info["singer"] = string.Join("/", s.GetProperty("artists").EnumerateArray().Select(a => a.GetProperty("name").GetString()));
                 info["cover"] = s.TryGetProperty("album", out var alb) && alb.TryGetProperty("picUrl", out var pu) ? pu.GetString() ?? "" : "";
             }
-            catch { info["song"] = "未知歌曲"; info["singer"] = "未知"; info["cover"] = ""; }
+            catch (Exception detailError)
+            {
+                logger.LogWarning("网易云详情失败（id {Id}）：{Msg}", id, detailError.Message);
+                Dictionary<string, string>? fallback = await SearchDetailFallbackAsync("163", id, "netease",
+                    "http://music.163.com/song?id=" + id,
+                    "http://music.163.com/song/media/outer/url?id=" + id + ".mp3");
+                if (fallback != null)
+                {
+                    logger.LogInformation("网易云详情已用第三方兜底（id {Id}）", id);
+                    return fallback;
+                }
+                Dictionary<string, string>? luosu = await LuoSuSongAsync("163", original);
+                if (luosu != null)
+                {
+                    logger.LogInformation("网易云详情已用洛苏API兜底（{Keyword}）", original);
+                    return luosu;
+                }
+                throw new Exception("拿不到网易云歌曲详情（id " + id + "）：" + detailError.Message
+                    + "\n换个 id 或改用歌名搜索；接口被风控时过一会儿再试");
+            }
             info["format"] = "netease";
             info["url"] = "http://music.163.com/song/media/outer/url?id=" + id + ".mp3";
             info["jump"] = "http://music.163.com/song?id=" + id;
@@ -1834,7 +2831,12 @@ public partial class ShareArkModule(
                 info["singer"] = dd.GetProperty("owner").GetProperty("name").GetString() ?? "bilibili";
                 info["cover"] = pic;
             }
-            catch { info["song"] = "未知视频"; info["singer"] = "bilibili"; info["cover"] = ""; }
+            catch (Exception detailError)
+            {
+                logger.LogWarning("B站视频详情失败（{Id}）：{Msg}", id, detailError.Message);
+                throw new Exception("拿不到 B站视频详情（" + id + "）：" + detailError.Message
+                    + "\n确认 BV 号没过期，或改用 BiliParse 先解析链接");
+            }
             info["url"] = "https://www.bilibili.com/video/" + id;
             info["jump"] = "https://www.bilibili.com/video/" + id;
             info["format"] = "bilibili";
@@ -1861,7 +2863,25 @@ public partial class ShareArkModule(
                 info["singer"] = string.Join("/", dd.GetProperty("singer").EnumerateArray().Select(a => a.GetProperty("name").GetString()));
                 info["cover"] = "https://y.qq.com/music/photo_new/T002R300x300M000" + albid + ".jpg";
             }
-            catch { info["song"] = "未知歌曲"; info["singer"] = "未知"; info["cover"] = ""; }
+            catch (Exception detailError)
+            {
+                logger.LogWarning("QQ音乐详情失败（{Id}）：{Msg}", id, detailError.Message);
+                Dictionary<string, string>? fallback = await SearchDetailFallbackAsync("qq", id, "qq",
+                    "https://y.qq.com/n/ryqq/songDetail/" + id, "");
+                if (fallback != null)
+                {
+                    logger.LogInformation("QQ音乐详情已用第三方兜底（{Id}）", id);
+                    return fallback;
+                }
+                Dictionary<string, string>? luosu = await LuoSuSongAsync("qq", original);
+                if (luosu != null)
+                {
+                    logger.LogInformation("QQ音乐详情已用洛苏API兜底（{Keyword}）", original);
+                    return luosu;
+                }
+                throw new Exception("拿不到 QQ音乐歌曲详情（" + id + "）：" + detailError.Message
+                    + "\n确认 songmid 是否正确，或改用歌名搜索");
+            }
             info["url"] = "https://y.qq.com/n/ryqq/songDetail/" + id;
             info["jump"] = "https://y.qq.com/n/ryqq/songDetail/" + id;
             info["format"] = "qq";
@@ -1875,25 +2895,33 @@ public partial class ShareArkModule(
                 var r = await SearchFirstAsync("kugou", id);
                 if (!string.IsNullOrWhiteSpace(r.id)) id = r.id;
             }
-            string songName = "酷狗音乐", singerName = "酷狗音乐", kugouCover = "", playUrl = "";
+            string songName, singerName, kugouCover, playUrl;
             string pageUrl = "https://www.kugou.com/song/#hash=" + id;
             try
             {
-                string du = WithQuery(SearchUrl("kugou"), KeyQ() + "id=" + Uri.EscapeDataString(id));
-                string dbody = await http.GetStringAsync(du);
-                using var ddoc = JsonDocument.Parse(dbody);
-                if (ddoc.RootElement.GetProperty("code").GetInt32() == 200)
-                {
-                    var dd = ddoc.RootElement.GetProperty("data");
-                    string D(string k) => dd.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
-                    if (D("title").Length > 0) songName = D("title");
-                    if (D("author").Length > 0) singerName = D("author");
-                    if (D("cover").Length > 0) kugouCover = D("cover").Replace("{size}", "480");
-                    if (D("url").Length > 0) playUrl = D("url");
-                    if (D("link").Length > 0) pageUrl = D("link");
-                }
+                JsonElement dd = await SearchDataAsync("kugou", "id=" + Uri.EscapeDataString(id));
+                string D(string k) => dd.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+                songName = D("title");
+                singerName = D("author");
+                kugouCover = D("cover").Length > 0 ? D("cover").Replace("{size}", "480") : "";
+                playUrl = D("url");
+                if (D("link").Length > 0) pageUrl = D("link");
             }
-            catch { }
+            catch (Exception detailError)
+            {
+                logger.LogWarning("酷狗详情失败（hash {Id}）：{Msg}", id, detailError.Message);
+                Dictionary<string, string>? luosu = await LuoSuSongAsync("kugou", original);
+                if (luosu != null)
+                {
+                    logger.LogInformation("酷狗详情已用洛苏API兜底（{Keyword}）", original);
+                    return luosu;
+                }
+                throw new Exception("拿不到酷狗歌曲详情（hash " + id + "）：" + detailError.Message
+                    + "\n没有播放地址和封面就没法发音乐卡，确认 hash 或改用歌名搜索");
+            }
+            if (songName.Length == 0) songName = "酷狗音乐";
+            if (singerName.Length == 0) singerName = "酷狗音乐";
+            if (playUrl.Length == 0) playUrl = pageUrl;
             if (!string.IsNullOrWhiteSpace(title)) songName = title;
             info["song"] = songName;
             info["singer"] = singerName;
@@ -1911,57 +2939,249 @@ public partial class ShareArkModule(
     async Task<string> SignAsync(string platform, string id, string? title)
     {
         var info = await ResolveInfoAsync(platform, id, title);
-        // 签名端所有参数必填且空值当缺失：封面为空时回落抓播放页的 og:image
-        if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("cover")))
+        // 签名端所有参数必填且空值当缺失：封面为空时回落抓播放页的 og:image。
+        // 免费源关掉就不抓页面，行为要跟开关一致
+        if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("cover")) && Configuration.EnableFreeSources)
         {
             var meta = await FetchMetaAsync(info.GetValueOrDefault("jump") ?? "");
             if (!string.IsNullOrWhiteSpace(meta.image)) info["cover"] = meta.image;
+            // 抓页面也拿不到封面时，再用 iTunes 公开接口按「歌名 歌手」兜一次
+            if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("cover")))
+            {
+                try
+                {
+                    string keyword = ((info.GetValueOrDefault("song") ?? "") + " " + (info.GetValueOrDefault("singer") ?? "")).Trim();
+                    if (keyword.Length > 0)
+                    {
+                        List<ArkTrackInfo> hits = ArkFreeSources.ParseItunes(
+                            await GetJsonAsync(ArkFreeSources.ItunesSearchUrl(keyword), "itunes.apple.com"));
+                        string cover = hits.FirstOrDefault(hit => hit.Cover.Length > 0)?.Cover ?? "";
+                        if (cover.Length > 0)
+                        {
+                            info["cover"] = cover;
+                            logger.LogInformation("封面已用 iTunes 兜底（{Keyword}）", keyword);
+                        }
+                    }
+                }
+                catch (Exception coverError)
+                {
+                    logger.LogWarning("iTunes 封面兜底失败：{Msg}", coverError.Message);
+                }
+            }
         }
-        if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("song"))) info["song"] = "未知";
-        if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("singer"))) info["singer"] = "未知";
-        if (!string.IsNullOrWhiteSpace(Configuration.ApiKey)) info["key"] = Configuration.ApiKey;
-
-        EnsureSignNotBlocked();
-        for (int attempt = 0; ; attempt++)
+        // 缺字段不再拿"未知"糊过去：签出来的是一张信息错的卡，不如明确报错让人换参数
+        if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("cover")))
         {
-            string query = string.Join("&", info.Select(kv => Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value ?? "")));
-            string fullUrl = WithQuery(MusicArkUrl(), query);
+            throw new Exception("拿不到封面（详情接口没给，免费源抓页面又" +
+                (Configuration.EnableFreeSources ? "失败" : "关着") + "），签名端会拒收；确认链接可访问后重试");
+        }
+        if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("song")))
+        {
+            throw new Exception("详情里没有歌名，没法做卡片标题；确认 id 或直接用歌名搜索");
+        }
+        if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("singer")))
+        {
+            throw new Exception("详情里没有歌手/作者，没法做卡片副标题；确认 id 或改用歌名搜索");
+        }
+        // 依次尝试：主站 → 备用站 → OIAPI 公共音乐卡签名。
+        // 全失败才抛出去，SendArkCard 仍会接住并退到 OneBot 标准音乐段。
+        List<SignNode> nodes = await MusicNodesAsync();
+        if (nodes.Count == 0)
+        {
+            throw new Exception("音乐卡签名节点一个都没配置：先填第三方接口基地址，或填备用签名基地址");
+        }
+        List<string> errors = new();
+        foreach (SignNode node in nodes)
+        {
+            string? cooling = NodeBlocked(node.Url);
+            if (cooling != null)
+            {
+                errors.Add(node.Name + "：" + cooling);
+                continue;
+            }
+            try
+            {
+                string card = node.Builtin
+                    ? await SignMusicOnBuiltinAsync(node, info)
+                    : await SignMusicOnNodeAsync(node, info);
+                MarkSignOk(node.Url);
+                return card;
+            }
+            catch (Exception nodeError)
+            {
+                MarkSignFailed(node.Url, nodeError.Message);
+                errors.Add(node.Name + "：" + nodeError.Message);
+                logger.LogWarning("音乐卡节点 {Node} 失败：{Msg}", node.Name, nodeError.Message);
+            }
+        }
+        throw new Exception("所有音乐卡签名节点都失败（" + string.Join("；", errors) + "）");
+    }
+
+    async Task<string> SignMusicOnNodeAsync(SignNode node, Dictionary<string, string> info)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            Dictionary<string, string> q = new(info);
+            // 每个节点用自己那份 key，避免主站 key 被带到备用站
+            q.Remove("key");
+            if (!string.IsNullOrWhiteSpace(node.ApiKey))
+            {
+                q["key"] = node.ApiKey;
+            }
+            string query = string.Join("&", q.Select(kv => Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value ?? "")));
+            string fullUrl = WithQuery(node.Url, query);
             string body;
             try
             {
                 body = await http.GetStringAsync(fullUrl);
             }
-            catch (Exception ex)
+            catch (Exception requestError)
             {
-                MarkSignFailed(ex.Message);
-                logger.LogWarning("音乐卡签名请求失败：{Msg} | {Url}", ex.Message, MaskKey(fullUrl));
-                throw new Exception("第三方签名连不上，先走备用方案");
+                throw new Exception("连不上：" + requestError.Message);
             }
-            using var doc = JsonDocument.Parse(body);
+            using JsonDocument doc = JsonDocument.Parse(body);
             if (Ok(doc.RootElement))
             {
-                MarkSignOk();
-                JsonNode? node = JsonNode.Parse(doc.RootElement.GetProperty("data").GetRawText());
-                string songName = info["song"];
-                try { songName = node!["meta"]!["music"]!["title"]!.GetValue<string>(); } catch { }
-                node!["prompt"] = "[分享]" + songName;
-                node!["ver"] = "0.0.0.1";
-                node!["view"] = "music";
-                return node.ToJsonString();
+                return NormalizeMusicCard(doc.RootElement.GetProperty("data"), info.GetValueOrDefault("song") ?? "");
             }
-            string msg = doc.RootElement.TryGetProperty("msg", out var mm) ? mm.GetString() ?? "" : "";
-            // 缓存的接口后缀失效（服务端报 API 不存在）：清掉重探，再试一次
-            if (attempt == 0 && msg.Contains("不存在"))
+            string msg = ReadMsg(doc.RootElement);
+            // 缓存的接口后缀失效（服务端报 API 不存在）：清掉该节点缓存重探一次
+            if (attempt == 0 && msg.Contains("不存在") && node.BaseUrl.Length > 0)
             {
-                _sfx.Clear();
-                await EnsureFit();
+                await RefitAsync(node.BaseUrl, "ark", node.ApiKey);
+                node = node with { Url = JoinUrl(node.BaseUrl, SfxOf(node.BaseUrl, "ark")) };
                 continue;
             }
-            // 地址带 key，别把整条 URL 甩给模型看；日志里留一份给排查
-            logger.LogWarning("音乐卡签名失败：{Msg} | {Url}", string.IsNullOrWhiteSpace(msg) ? "（无说明）" : msg, MaskKey(fullUrl));
-            MarkSignFailed(msg.Length > 0 ? msg : "服务端无说明");
-            throw new Exception("第三方签名失败" + (msg.Length > 0 ? "（" + msg + "）" : ""));
+            logger.LogWarning("音乐卡节点 {Node} 签名失败：{Msg} | {Url}", node.Name, msg.Length > 0 ? msg : "（无说明）", MaskKey(fullUrl));
+            throw new Exception("接口回 code=" + ReadCode(doc.RootElement) + (msg.Length > 0 ? "：" + msg : ""));
         }
+        throw new Exception("重试后仍失败");
+    }
+
+    // OIAPI 公共签名：免 key，成功码是 1，data 直接是卡片对象；格式枚举要 163 而不是 netease
+    async Task<string> SignMusicOnBuiltinAsync(SignNode node, Dictionary<string, string> info)
+    {
+        Dictionary<string, string> q = new()
+        {
+            ["url"] = info.GetValueOrDefault("url") ?? "",
+            ["song"] = info.GetValueOrDefault("song") ?? "",
+            ["singer"] = info.GetValueOrDefault("singer") ?? "",
+            ["cover"] = info.GetValueOrDefault("cover") ?? "",
+            ["jump"] = info.GetValueOrDefault("jump") ?? "",
+            ["format"] = BuiltinFormat(info.GetValueOrDefault("format") ?? ""),
+        };
+        if (!string.IsNullOrWhiteSpace(node.ApiKey))
+        {
+            q["key"] = node.ApiKey;
+        }
+        string query = string.Join("&", q.Select(kv => Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value ?? "")));
+        string fullUrl = WithQuery(node.Url, query);
+        string body;
+        try
+        {
+            body = await http.GetStringAsync(fullUrl);
+        }
+        catch (Exception requestError)
+        {
+            throw new Exception("连不上：" + requestError.Message);
+        }
+        using JsonDocument doc = JsonDocument.Parse(body);
+        JsonElement root = doc.RootElement;
+        bool ok = root.ValueKind == JsonValueKind.Object
+            && root.TryGetProperty("code", out JsonElement code)
+            && code.ValueKind == JsonValueKind.Number
+            && code.GetInt32() is 1 or 200 or 0;
+        if (!ok)
+        {
+            throw new Exception("接口回 code=" + ReadCode(root) + "：" + ReadMsg(root));
+        }
+        if (!root.TryGetProperty("data", out JsonElement data) || data.ValueKind == JsonValueKind.Null)
+        {
+            throw new Exception("公共签名没回 data");
+        }
+        return NormalizeMusicCard(data, info.GetValueOrDefault("song") ?? "");
+    }
+
+    static string BuiltinFormat(string format)
+    {
+        string normalized = (format ?? "").Trim().ToLowerInvariant();
+        return normalized == "netease" ? "163" : normalized;
+    }
+
+    // 把各家的 data（对象 / JSON 字符串 / 数组）统一成一张可直塞的卡片
+    static string NormalizeMusicCard(JsonElement data, string fallbackSong)
+    {
+        string raw = CardJsonFrom(data);
+        JsonNode? node = JsonNode.Parse(raw);
+        if (node is not JsonObject)
+        {
+            throw new Exception("签名接口回的卡片不是 JSON 对象");
+        }
+        if (node["meta"] is JsonObject)
+        {
+            string songName = fallbackSong;
+            try
+            {
+                string title = node["meta"]!["music"]!["title"]!.GetValue<string>();
+                if (title.Length > 0)
+                {
+                    songName = title;
+                }
+            }
+            catch
+            {
+                // 拿不到标题就用搜索/详情里的歌名
+            }
+            node["prompt"] = "[分享]" + songName;
+            if (node["ver"] == null)
+            {
+                node["ver"] = "0.0.0.1";
+            }
+            if (node["view"] == null)
+            {
+                node["view"] = "music";
+            }
+        }
+        return node.ToJsonString();
+    }
+
+    static string CardJsonFrom(JsonElement data)
+    {
+        return data.ValueKind switch
+        {
+            JsonValueKind.String => data.GetString() ?? "",
+            JsonValueKind.Array when data.GetArrayLength() > 0 => CardJsonFrom(data[0]),
+            JsonValueKind.Object => data.GetRawText(),
+            _ => throw new Exception("签名接口回的数据不是卡片"),
+        };
+    }
+
+    static int ReadCode(JsonElement root)
+        => root.ValueKind == JsonValueKind.Object
+           && root.TryGetProperty("code", out JsonElement code)
+           && code.ValueKind == JsonValueKind.Number ? code.GetInt32() : -1;
+
+    static string ReadMsg(JsonElement root)
+    {
+        string msg = GetStringField(root, "msg");
+        return msg.Length > 0 ? msg : GetStringField(root, "message");
+    }
+
+    // 某个节点的接口后缀被服务端判为不存在：只清这个节点的缓存并重新探测
+    async Task RefitAsync(string baseUrl, string role, string apiKey)
+    {
+        string norm = NormBase(baseUrl);
+        if (norm.Length == 0)
+        {
+            return;
+        }
+        _sfxBackup.Remove(norm + "|" + role);
+        if (norm == NormBase(Configuration.BaseUrl))
+        {
+            _sfx.Remove(role);
+        }
+        string[] cands = _cands.TryGetValue(role, out string[] known) ? known : new[] { role };
+        await Fit(role, cands, ProbeOf(role), norm, apiKey);
     }
 
     private static ClientWebSocket? _sharedWs;
@@ -2147,6 +3367,8 @@ public partial class ShareArkModule(
                 + "ProbeBase 探测三个签名/搜索接口通不通，ProbeAll 列出基地址下发现的所有接口。"
                 + "另一批不要 key、不要配置的走公开接口：ArkLyric 取歌词（LRCLIB 与网易云官方）、ArkCover 找封面与试听（iTunes）、ArkLinkMeta 自己抓页面 meta 出卡片素材、ArkFreeProbe 体检这些源。"
                 + "发卡片前的素材可以先用它们备着，但签名与发送仍走第三方签名服务。"
+                + "容灾顺序：主站 → 配置里的备用签名基地址 → OIAPI 公共音乐卡签名（仅音乐卡）；任一节点失败只冷却它自己并立刻换下一个。"
+                + "所有签名节点都失败时，音乐卡仍回退 OneBot 标准音乐段，分享卡仍回退图文/纯文本，B站系列仍回退官方接口——这些兜底没有删。"
         };
         functionCaller.RegisterHandler(handler, DocumentMode.Implicit, cancellationToken: DestroyCancellationToken);
         return Task.CompletedTask;

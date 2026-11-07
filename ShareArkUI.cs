@@ -49,7 +49,12 @@ public sealed class ShareArkUI : ModuleUIBase<ShareArkModule, ShareArkConfig>
         !string.IsNullOrWhiteSpace(Configuration.BaseUrl)
         || !string.IsNullOrWhiteSpace(Configuration.MusicArkUrl)
         || !string.IsNullOrWhiteSpace(Configuration.ShareArkUrl)
-        || !string.IsNullOrWhiteSpace(Configuration.SearchUrl);
+        || !string.IsNullOrWhiteSpace(Configuration.SearchUrl)
+        || !string.IsNullOrWhiteSpace(Configuration.BackupBaseUrls)
+        || !string.IsNullOrWhiteSpace(Configuration.ExtraMusicSignUrls)
+        || !string.IsNullOrWhiteSpace(Configuration.ExtraShareSignUrls)
+        || Configuration.EnablePublicMusicApis
+        || (Configuration.EnableBuiltinMusicSign && !string.IsNullOrWhiteSpace(Configuration.BuiltinMusicArkUrl));
 
     async Task RunProbeBase()
     {
