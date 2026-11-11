@@ -35,7 +35,6 @@ public sealed class ShareArkUI : ModuleUIBase<ShareArkModule, ShareArkConfig>
         SuranUiKit.Render(this, StateHasChanged, b, Configuration,
             "QQ 分享卡片",
             "自己完成音乐卡与分享卡签名并直塞协议端，不依赖协议端的签名地址配置",
-            "#f97316",
             actions:
             [
                 new SuranUiKit.UiAction(probingBase ? "探测中…" : "探测基地址", RunProbeBase),
