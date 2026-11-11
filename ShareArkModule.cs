@@ -25,6 +25,10 @@ namespace Suran.ShareArk;
 
 public class ShareArkConfig
 {
+    [DisplayName("运行·功能文档常驻")]
+    [Description("开：功能说明常驻系统提示词，模型随时看得到工具；关：隐式加载省 token，模型先输出入口标签再读文档。发卡片/解析链接多是主人明确要求时用，默认关")]
+    public bool DocumentAlwaysResident { get; set; } = false;
+
     [DisplayName("第三方接口基地址")]
     [Description("第三方签名服务基地址。")]
     public string BaseUrl { get; set; } = "";
@@ -682,6 +686,11 @@ public partial class ShareArkModule(
     static string WithQuery(string url, string query) => url.Contains('?') ? url + "&" + query : url + "?" + query;
     // 报错里附请求URL时把 key 打码
     static string MaskKey(string url) => Regex.Replace(url, "([?&]key=)[^&]+", "$1***", RegexOptions.IgnoreCase);
+    static string Brief(string message, int max = 140)
+    {
+        string one = (message ?? "").Replace('\r', ' ').Replace('\n', ' ').Trim();
+        return one.Length <= max ? one : one[..max] + "…";
+    }
     static string NodeKey(string url) => MaskKey(url);
     // 候选可以是后缀也可以是完整地址（自动发现的文档链接可能带全路径）
     static string JoinUrl(string b, string c) => c.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? c : b + "/" + c;
@@ -1309,7 +1318,8 @@ public partial class ShareArkModule(
             (bool Success, string Message) sent = await SendJsonAsync(target, isGroup, card);
             if (sent.Success)
             {
-                interactor.Poke("卡片已发出");
+                // 发卡成功不往上下文里塞系统推送：群里已经能看到卡片
+                logger.LogInformation("卡片已发出");
                 return;
             }
             thirdPartyError = sent.Message;
@@ -1322,7 +1332,7 @@ public partial class ShareArkModule(
         if (Configuration.EnableOfficialFallback == false)
         {
             logger.LogWarning("发卡片失败：" + thirdPartyError);
-            interactor.Poke("❌ 发卡片失败：" + thirdPartyError);
+            interactor.Poke("❌ 发卡片失败：" + Brief(thirdPartyError));
             return;
         }
         // 签名成功但协议端不吃 json 卡片时，退到 OneBot 标准音乐段
@@ -1334,15 +1344,16 @@ public partial class ShareArkModule(
             (bool Success, string Message) official = await SendSegmentsAsync(target, isGroup, segments);
             if (official.Success)
             {
-                interactor.Poke("✅ 卡片已发出（OneBot 标准音乐段容灾；json 卡片那步失败：" + thirdPartyError + "）");
+                // 成功就不 Poke：之前的失败详情会把上下文刷屏，日志里留一份即可
+                logger.LogInformation("卡片已发出（OneBot 音乐段兜底；json 卡片失败：{Third}）", Brief(thirdPartyError, 300));
                 return;
             }
-            interactor.Poke("❌ 发卡片失败：json 卡片（" + thirdPartyError + "）；官方音乐段（" + official.Message + "）");
+            interactor.Poke("❌ 发卡片失败：json 卡片（" + Brief(thirdPartyError) + "）；官方音乐段（" + Brief(official.Message) + "）");
         }
         catch (Exception officialError)
         {
             logger.LogWarning("发卡片失败：第三方 {Third}；官方容灾 {Official}", thirdPartyError, officialError.Message);
-            interactor.Poke("❌ 发卡片：第三方（" + thirdPartyError + "）；官方容灾（" + officialError.Message + "）");
+            interactor.Poke("❌ 发卡片：第三方（" + Brief(thirdPartyError) + "）；官方容灾（" + Brief(officialError.Message) + "）");
         }
     }
 
@@ -1385,8 +1396,14 @@ public partial class ShareArkModule(
             // 依次尝试主站 / 备用站；全失败才抛给下面的图文兜底
             string card = await SignShareCardAsync(title, desc, url, preview, prompt);
             (bool Success, string Message) sent = await SendJsonAsync(target, isGroup, card);
-            if (sent.Success) interactor.Poke("分享卡已发出");
-            else interactor.Poke("❌ 分享卡没发出去：" + sent.Message);
+            if (sent.Success)
+            {
+                logger.LogInformation("分享卡已发出");
+            }
+            else
+            {
+                interactor.Poke("❌ 分享卡没发出去：" + Brief(sent.Message));
+            }
         }
         catch (Exception ex)
         {
@@ -1401,16 +1418,16 @@ public partial class ShareArkModule(
                     await SendLinkFallbackAsync(target, isGroup, title, desc, url, preview);
                 if (plain.Success)
                 {
-                    interactor.Poke("✅ 发出去了（卡片签名不可用，退成图文消息）");
+                    logger.LogInformation("分享卡已发出（签名不可用，退成图文消息）");
                     return;
                 }
-                interactor.Poke("❌ 分享卡没发成：签名（" + ex.Message + "）；图文兜底（" + plain.Message + "）");
+                interactor.Poke("❌ 分享卡没发成：签名（" + Brief(ex.Message) + "）；图文兜底（" + Brief(plain.Message) + "）");
                 return;
             }
 
             // B站链接被挡、网络抓取失败这类，不该假装发出去
             string hint = signProblem ? "。这次没发成卡片，退一步直接把链接当普通文本发出去" : "";
-            interactor.Poke("发分享卡失败：" + ex.Message + hint);
+            interactor.Poke("发分享卡失败：" + Brief(ex.Message) + hint);
         }
     }
 
@@ -3370,7 +3387,9 @@ public partial class ShareArkModule(
                 + "容灾顺序：主站 → 配置里的备用签名基地址 → OIAPI 公共音乐卡签名（仅音乐卡）；任一节点失败只冷却它自己并立刻换下一个。"
                 + "所有签名节点都失败时，音乐卡仍回退 OneBot 标准音乐段，分享卡仍回退图文/纯文本，B站系列仍回退官方接口——这些兜底没有删。"
         };
-        functionCaller.RegisterHandler(handler, DocumentMode.Implicit, cancellationToken: DestroyCancellationToken);
+        functionCaller.RegisterHandler(handler,
+            (Configuration?.DocumentAlwaysResident ?? false) ? DocumentMode.Explicit : DocumentMode.Implicit,
+            cancellationToken: DestroyCancellationToken);
         return Task.CompletedTask;
     }
 
