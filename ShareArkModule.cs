@@ -244,19 +244,12 @@ public partial class ShareArkModule(
 
     HttpClient BuildClient(bool allowRedirect, string proxy, bool foreignOnly)
     {
-        HttpClient direct = CreatePlainClient(allowRedirect, "");
-        if (proxy.Length == 0)
-        {
-            return direct;
-        }
-        HttpClient proxied = CreatePlainClient(allowRedirect, proxy);
-        return new HttpClient(new ProxyRoutingHandler(direct, proxied, foreignOnly))
-        {
-            Timeout = allowRedirect ? TimeSpan.FromSeconds(20) : Timeout.InfiniteTimeSpan
-        };
+        // 不能包两层 HttpClient：外层 HttpClient 会把同一个 HttpRequestMessage 标记成已发送，
+        // 内层再发就抛「The request message was already sent」。改成单个 handler + 按域名判断的 IWebProxy。
+        return CreatePlainClient(allowRedirect, proxy, foreignOnly);
     }
 
-    HttpClient CreatePlainClient(bool allowRedirect, string proxy)
+    HttpClient CreatePlainClient(bool allowRedirect, string proxy, bool foreignOnly)
     {
         HttpClientHandler handler = new()
         {
@@ -267,32 +260,28 @@ public partial class ShareArkModule(
         };
         if (proxy.Length > 0)
         {
-            handler.Proxy = new WebProxy(proxy);
             handler.UseProxy = true;
+            handler.Proxy = foreignOnly
+                ? new SelectiveProxy(new WebProxy(proxy))
+                : new WebProxy(proxy);
         }
         return allowRedirect
             ? new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) }
             : new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
     }
 
-    /// <summary>按请求域名决定走直连还是代理：这是「仅境外平台走代理」的落点。</summary>
-    sealed class ProxyRoutingHandler(HttpClient direct, HttpClient proxied, bool foreignOnly) : HttpMessageHandler
+    /// <summary>「仅境外平台走代理」的落点：按请求域名决定交给代理还是直连。</summary>
+    sealed class SelectiveProxy(WebProxy inner) : IWebProxy
     {
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        public ICredentials? Credentials
         {
-            HttpClient target = foreignOnly && ShouldProxy(request.RequestUri) ? proxied : direct;
-            return target.SendAsync(request, cancellationToken);
+            get => inner.Credentials;
+            set => inner.Credentials = value;
         }
 
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                direct.Dispose();
-                proxied.Dispose();
-            }
-            base.Dispose(disposing);
-        }
+        public Uri? GetProxy(Uri destination) => ShouldProxy(destination) ? inner.GetProxy(destination) : null;
+
+        public bool IsBypassed(Uri host) => ShouldProxy(host) == false;
     }
 
     /// <summary>需要走代理的境外站点（按域名后缀匹配；签名服务、国内平台一律直连）。</summary>
