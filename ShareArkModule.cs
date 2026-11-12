@@ -37,6 +37,14 @@ public class ShareArkConfig
     [Description("第三方接口凭证 key，可留空。")]
     public string ApiKey { get; set; } = "";
 
+    [DisplayName("网络·代理地址")]
+    [Description("出站请求走这个代理，支持 http:// 与 socks5://；留空直连。境外平台（YouTube/Spotify/Apple Music/X）抓不到时填这里，改完不用重载插件")]
+    public string ProxyUrl { get; set; } = "";
+
+    [DisplayName("网络·仅境外平台走代理")]
+    [Description("开：只有 YouTube/Spotify/Apple Music/SoundCloud/Vimeo/TikTok/X/Instagram/GitHub/Steam 这类境外站走代理，国内接口与签名服务直连；关：全部出站请求都走代理")]
+    public bool ProxyForeignOnly { get; set; } = true;
+
     [DisplayName("协议端·地址")]
     [Description("留空 = 自动跟随「QQ 聊天」插件的配置（推荐）。填了就用这里的，例如 ws://127.0.0.1:3001")]
     public string WsUrl { get; set; } = "";
@@ -205,19 +213,113 @@ public partial class ShareArkModule(
     }
 
 
-    static readonly HttpClient http = new(new HttpClientHandler {
-        // 实测：B站这类站即使请求没带 Accept-Encoding 也照回 Content-Encoding: gzip，
-        // 不自动解压就读到一坨压缩字节，抓网页 meta（标题/预览图）全军覆没
-        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
-    }) { Timeout = TimeSpan.FromSeconds(20) };
+    HttpClient? httpClient;
+    HttpClient? safeHttpClient;
+    string? clientsKey;
 
-    // 抓用户给的链接必须自己校验每一跳：默认的自动重定向会顺着 302 一路跳进内网，
-    // 而 .NET 没有"禁止私有地址"的开关。这个客户端只用于这类抓取，别影响签名/B站那些正常请求
-    static readonly HttpClient safeHttp = new(new HttpClientHandler {
-        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
-        AllowAutoRedirect = false
-        // 超时交给每次请求自己的 CTS：这里的 Timeout 会盖掉调用方给的 3~90 秒配置
-    }) { Timeout = Timeout.InfiniteTimeSpan };
+    /// <summary>普通出站请求客户端：按配置决定走直连还是代理。</summary>
+    HttpClient Http => EnsureHttp(allowRedirect: true);
+
+    /// <summary>抓用户链接的客户端：不自动跳转，代理规则同样生效。</summary>
+    HttpClient SafeHttp => EnsureHttp(allowRedirect: false);
+
+    /// <summary>代理地址或「仅境外」开关变了，就在下一次请求时重建客户端，不用重载插件。</summary>
+    HttpClient EnsureHttp(bool allowRedirect)
+    {
+        string proxy = (Configuration?.ProxyUrl ?? "").Trim();
+        bool foreignOnly = Configuration?.ProxyForeignOnly ?? true;
+        string key = proxy + "|" + (foreignOnly ? "foreign" : "all");
+        if (clientsKey != key)
+        {
+            httpClient?.Dispose();
+            safeHttpClient?.Dispose();
+            httpClient = null;
+            safeHttpClient = null;
+            clientsKey = key;
+        }
+        return allowRedirect
+            ? httpClient ??= BuildClient(true, proxy, foreignOnly)
+            : safeHttpClient ??= BuildClient(false, proxy, foreignOnly);
+    }
+
+    HttpClient BuildClient(bool allowRedirect, string proxy, bool foreignOnly)
+    {
+        HttpClient direct = CreatePlainClient(allowRedirect, "");
+        if (proxy.Length == 0)
+        {
+            return direct;
+        }
+        HttpClient proxied = CreatePlainClient(allowRedirect, proxy);
+        return new HttpClient(new ProxyRoutingHandler(direct, proxied, foreignOnly))
+        {
+            Timeout = allowRedirect ? TimeSpan.FromSeconds(20) : Timeout.InfiniteTimeSpan
+        };
+    }
+
+    HttpClient CreatePlainClient(bool allowRedirect, string proxy)
+    {
+        HttpClientHandler handler = new()
+        {
+            // 实测：B站这类站即使请求没带 Accept-Encoding 也照回 Content-Encoding: gzip，
+            // 不自动解压就读到一坨压缩字节，抓网页 meta（标题/预览图）全军覆没
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
+            AllowAutoRedirect = allowRedirect
+        };
+        if (proxy.Length > 0)
+        {
+            handler.Proxy = new WebProxy(proxy);
+            handler.UseProxy = true;
+        }
+        return allowRedirect
+            ? new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) }
+            : new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+    }
+
+    /// <summary>按请求域名决定走直连还是代理：这是「仅境外平台走代理」的落点。</summary>
+    sealed class ProxyRoutingHandler(HttpClient direct, HttpClient proxied, bool foreignOnly) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            HttpClient target = foreignOnly && ShouldProxy(request.RequestUri) ? proxied : direct;
+            return target.SendAsync(request, cancellationToken);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                direct.Dispose();
+                proxied.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    /// <summary>需要走代理的境外站点（按域名后缀匹配；签名服务、国内平台一律直连）。</summary>
+    static readonly string[] proxyHosts =
+    [
+        "youtube.com", "youtu.be", "spotify.com", "music.apple.com", "itunes.apple.com",
+        "soundcloud.com", "vimeo.com", "tiktok.com", "twitter.com", "x.com", "instagram.com",
+        "github.com", "githubassets.com", "steampowered.com", "bandcamp.com",
+        "lrclib.net", "microlink.io"
+    ];
+
+    static bool ShouldProxy(Uri? uri)
+    {
+        if (uri == null)
+        {
+            return false;
+        }
+        string host = uri.Host.ToLowerInvariant();
+        foreach (string suffix in proxyHosts)
+        {
+            if (host == suffix || host.EndsWith("." + suffix, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 
     const long SafeFetchMaxBytes = 4 * 1024 * 1024;
     const int SafeFetchMaxHops = 4;
@@ -230,7 +332,7 @@ public partial class ShareArkModule(
     /// page=true 时还要求返回网页/JSON，避免把图片当页面塞进 meta 解析。
     /// 网络层失败（连不上/被重置）重试一次；被安全策略拒掉的不重试。
     /// </summary>
-    static async Task<FetchResult> SafeFetchAsync(string url, string? referer, TimeSpan timeout, bool page)
+    async Task<FetchResult> SafeFetchAsync(string url, string? referer, TimeSpan timeout, bool page)
     {
         Exception? lastError = null;
         for (int attempt = 0; attempt < 2; attempt++)
@@ -250,7 +352,7 @@ public partial class ShareArkModule(
     static bool IsTransientFetchError(Exception error)
         => error is HttpRequestException || error is IOException || error is SocketException;
 
-    static async Task<FetchResult> SafeFetchOnceAsync(string url, string? referer, TimeSpan timeout, bool page)
+    async Task<FetchResult> SafeFetchOnceAsync(string url, string? referer, TimeSpan timeout, bool page)
     {
         Uri current = await VerifyPublicUriAsync(url);
         using CancellationTokenSource cts = new(timeout);
@@ -262,7 +364,7 @@ public partial class ShareArkModule(
             {
                 request.Headers.TryAddWithoutValidation("Referer", referer);
             }
-            using HttpResponseMessage response = await safeHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            using HttpResponseMessage response = await SafeHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
             if ((int)response.StatusCode is >= 300 and <= 399)
             {
                 Uri? location = response.Headers.Location;
@@ -716,7 +818,7 @@ public partial class ShareArkModule(
             try
             {
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                using var r = await http.GetAsync(JoinUrl(norm, c) + "?" + keyQ + probe, cts.Token);
+                using var r = await Http.GetAsync(JoinUrl(norm, c) + "?" + keyQ + probe, cts.Token);
                 string b = await r.Content.ReadAsStringAsync();
                 using var d = JsonDocument.Parse(b);
                 // 只认成功码：错误路径回的 {code:404,msg:"API不存在"} 也带 code，一律不认
@@ -813,7 +915,7 @@ public partial class ShareArkModule(
             try
             {
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                string b = await http.GetStringAsync(root + "/" + docPath, cts.Token);
+                string b = await Http.GetStringAsync(root + "/" + docPath, cts.Token);
                 using var d = JsonDocument.Parse(b);
                 if (d.RootElement.ValueKind == JsonValueKind.Object && d.RootElement.TryGetProperty("paths", out var ps))
                     foreach (var p in ps.EnumerateObject())
@@ -827,7 +929,7 @@ public partial class ShareArkModule(
             try
             {
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                string html = await http.GetStringAsync(pageUrl, cts.Token);
+                string html = await Http.GetStringAsync(pageUrl, cts.Token);
                 foreach (Match m in Regex.Matches(html, @"href=[""']([^""']+?)[""']"))
                 {
                     string h = m.Groups[1].Value;
@@ -870,7 +972,7 @@ public partial class ShareArkModule(
         {
             try
             {
-                using var r = await http.GetAsync(url);
+                using var r = await Http.GetAsync(url);
                 string b = await r.Content.ReadAsStringAsync();
                 // 以前只要返回体带 code 就算"通"——服务端回 code:500 也是带 code 的，
                 // 结果探测报告一片绿，实际一个也签不出来。
@@ -963,7 +1065,7 @@ public partial class ShareArkModule(
         try
         {
             string effectiveProbe = builtin ? probe.Replace("format=netease", "format=163") : probe;
-            using HttpResponseMessage response = await http.GetAsync(WithQuery(node.Url, KeyQ(node.ApiKey) + effectiveProbe));
+            using HttpResponseMessage response = await Http.GetAsync(WithQuery(node.Url, KeyQ(node.ApiKey) + effectiveProbe));
             string body = await response.Content.ReadAsStringAsync();
             using JsonDocument doc = JsonDocument.Parse(body);
             JsonElement root = doc.RootElement;
@@ -996,7 +1098,7 @@ public partial class ShareArkModule(
         {
             string url = WithQuery((Configuration.LuoSuBaseUrl ?? "").Trim().TrimEnd('/') + "/api/qqmusic/",
                 "ss=" + Uri.EscapeDataString("晴天") + "&format=json&t=2");
-            string body = await http.GetStringAsync(url);
+            string body = await Http.GetStringAsync(url);
             using JsonDocument doc = JsonDocument.Parse(body);
             bool ok = doc.RootElement.ValueKind == JsonValueKind.Object && ReadCode(doc.RootElement) == 200;
             parts.Add("洛苏 QQ " + (ok ? "通" : "不通（code=" + ReadCode(doc.RootElement) + "）"));
@@ -1009,7 +1111,7 @@ public partial class ShareArkModule(
         {
             string url = WithQuery((Configuration.TangDouZiBaseUrl ?? "").Trim().TrimEnd('/') + "/a/qqmusic.php",
                 "nr=" + Uri.EscapeDataString("晴天") + "&return=json");
-            string body = await http.GetStringAsync(url);
+            string body = await Http.GetStringAsync(url);
             using JsonDocument doc = JsonDocument.Parse(body);
             parts.Add("糖豆子 QQ " + (doc.RootElement.ValueKind == JsonValueKind.Array && doc.RootElement.GetArrayLength() > 0
                 ? "通" : "回空"));
@@ -1067,7 +1169,7 @@ public partial class ShareArkModule(
                     try
                     {
                         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                        string body = await http.GetStringAsync(b + "/" + docPath, cts.Token);
+                        string body = await Http.GetStringAsync(b + "/" + docPath, cts.Token);
                         using var d = JsonDocument.Parse(body);
                         if (d.RootElement.ValueKind == JsonValueKind.Object && d.RootElement.TryGetProperty("paths", out var ps))
                             foreach (var p in ps.EnumerateObject())
@@ -1083,7 +1185,7 @@ public partial class ShareArkModule(
                 try
                 {
                     using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                    string html = await http.GetStringAsync(pageUrl, cts.Token);
+                    string html = await Http.GetStringAsync(pageUrl, cts.Token);
                     foreach (Match m in Regex.Matches(html, @"href=[""']([^""']+?)[""']"))
                     {
                         string h = m.Groups[1].Value.Split('?')[0];
@@ -1212,7 +1314,7 @@ public partial class ShareArkModule(
             try
             {
                 string u = WithQuery(node.Url, KeyQ(node.ApiKey) + queryPart);
-                string body = await http.GetStringAsync(u);
+                string body = await Http.GetStringAsync(u);
                 using JsonDocument doc = JsonDocument.Parse(body);
                 if (Ok(doc.RootElement) == false)
                 {
@@ -1241,7 +1343,7 @@ public partial class ShareArkModule(
             try
             {
                 string u = WithQuery(Configuration.BiliSearchUrl.Trim(), KeyQ() + "msg=" + Uri.EscapeDataString(keyword));
-                string body = await http.GetStringAsync(u);
+                string body = await Http.GetStringAsync(u);
                 using var doc = JsonDocument.Parse(body);
                 if (!Ok(doc.RootElement))
                     throw new Exception(doc.RootElement.TryGetProperty("msg", out var mm) ? mm.GetString() ?? "" : "搜索失败");
@@ -1274,7 +1376,7 @@ public partial class ShareArkModule(
         req.Headers.Referrer = new Uri("https://www.bilibili.com/");
         req.Headers.TryAddWithoutValidation("Cookie", "buvid3=1; b_nut=1");
         req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
-        string obody = await (await http.SendAsync(req)).Content.ReadAsStringAsync();
+        string obody = await (await Http.SendAsync(req)).Content.ReadAsStringAsync();
         using var odoc = JsonDocument.Parse(obody);
         // B站成功也是 code:0，和签名接口的 200 不一样；被风控时回 -412 且没有 data.result，
         // 原来直接 GetProperty 会抛 KeyNotFoundException，报错里看不出是"被限流"还是"没搜到"
@@ -1368,6 +1470,13 @@ public partial class ShareArkModule(
         [Description("目标群号或QQ号")] long? targetId = null,
         [Description("group或private，默认group")] string? type = null)
     {
+        await SendShareCardCoreAsync(url, title, desc, preview, prompt, targetId, type, allowBili: false);
+    }
+
+    /// <summary>分享卡核心：allowBili=true 时放行B站非视频页（平台卡内部用），直接调用的工具仍挡住B站。</summary>
+    async Task SendShareCardCoreAsync(string url, string? title, string? desc, string? preview, string? prompt,
+        long? targetId, string? type, bool allowBili)
+    {
         if (Gate(Configuration.EnableSendShareCard, "发通用分享卡")) return;
         if (targetId == null)
             throw new Exception("没给目标，发群里还是私聊得说一个");
@@ -1380,7 +1489,7 @@ public partial class ShareArkModule(
             // 过滤B站链接：B站走专用搜索+音乐卡接口，不走通用分享卡
             string host = "";
             try { host = new Uri(url).Host.ToLowerInvariant(); } catch { }
-                if ((host.Contains("bilibili.com") || host.Contains("b23.tv") || host.Contains("biligame.com")) && !host.StartsWith("live."))
+                if (allowBili == false && (host.Contains("bilibili.com") || host.Contains("b23.tv") || host.Contains("biligame.com")) && !host.StartsWith("live."))
                     throw new Exception("B站视频/主页链接不走自定义卡，用 SearchBili 拿BV号再 SendArkCard，或用 BiliParse 解析这个链接，直播可直接发");
 
             // 免费源开关关掉后，发卡就不能再偷偷抓页面：只用调用方给的标题/描述/预览
@@ -1486,7 +1595,7 @@ public partial class ShareArkModule(
             string body;
             try
             {
-                body = await http.GetStringAsync(full);
+                body = await Http.GetStringAsync(full);
             }
             catch (Exception requestError)
             {
@@ -1594,7 +1703,7 @@ public partial class ShareArkModule(
             }
             try
             {
-                string body = await http.GetStringAsync(WithQuery(url, string.Join("&", q)));
+                string body = await Http.GetStringAsync(WithQuery(url, string.Join("&", q)));
                 using JsonDocument doc = JsonDocument.Parse(body);
                 if (ReadCode(doc.RootElement) != 200)
                 {
@@ -1926,7 +2035,7 @@ public partial class ShareArkModule(
         string cookie = LoadBiliCookie();
         request.Headers.TryAddWithoutValidation("Cookie", (cookie.Length > 0 ? cookie + "; " : "") + "buvid3=1; b_nut=1");
         request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
-        string body = await (await http.SendAsync(request)).Content.ReadAsStringAsync();
+        string body = await (await Http.SendAsync(request)).Content.ReadAsStringAsync();
         using JsonDocument parsed = JsonDocument.Parse(body);
         JsonElement root = parsed.RootElement.Clone();
         int code = root.TryGetProperty("code", out JsonElement codeElement) && codeElement.ValueKind == JsonValueKind.Number
@@ -1997,7 +2106,7 @@ public partial class ShareArkModule(
         {
             try
             {
-                using HttpResponseMessage redirectResponse = await http.GetAsync(workUrl);
+                using HttpResponseMessage redirectResponse = await Http.GetAsync(workUrl);
                 string? finalUrl = redirectResponse.RequestMessage?.RequestUri?.ToString();
                 if (string.IsNullOrEmpty(finalUrl) == false)
                 {
@@ -2153,7 +2262,7 @@ public partial class ShareArkModule(
             }
             using HttpRequestMessage request = new(HttpMethod.Get,
                 "https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=" + Uri.EscapeDataString(qrcodeKey));
-            using HttpResponseMessage response = await http.SendAsync(request);
+            using HttpResponseMessage response = await Http.SendAsync(request);
             string body = await response.Content.ReadAsStringAsync();
             using JsonDocument parsed = JsonDocument.Parse(body);
             JsonElement data = parsed.RootElement.GetProperty("data").Clone();
@@ -2289,7 +2398,7 @@ public partial class ShareArkModule(
                 ["type"] = "1",
                 ["limit"] = "5"
             });
-            string body = await (await http.SendAsync(request)).Content.ReadAsStringAsync();
+            string body = await (await Http.SendAsync(request)).Content.ReadAsStringAsync();
             using JsonDocument doc = JsonDocument.Parse(body);
             JsonElement songs = doc.RootElement.GetProperty("result").GetProperty("songs").Clone();
             foreach (JsonElement song in songs.EnumerateArray())
@@ -2308,7 +2417,7 @@ public partial class ShareArkModule(
                 "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg?format=json&key=" + Uri.EscapeDataString(keyword));
             request.Headers.Referrer = new Uri("https://y.qq.com/");
             request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
-            string body = await (await http.SendAsync(request)).Content.ReadAsStringAsync();
+            string body = await (await Http.SendAsync(request)).Content.ReadAsStringAsync();
             using JsonDocument doc = JsonDocument.Parse(body);
             JsonElement items = doc.RootElement.GetProperty("data").GetProperty("song").GetProperty("itemlist").Clone();
             foreach (JsonElement item in items.EnumerateArray())
@@ -2336,7 +2445,7 @@ public partial class ShareArkModule(
             string kugouBody;
             try
             {
-                using HttpResponseMessage kugou = await http.SendAsync(request);
+                using HttpResponseMessage kugou = await Http.SendAsync(request);
                 kugouBody = await kugou.Content.ReadAsStringAsync();
             }
             catch (Exception kugouError)
@@ -2624,7 +2733,7 @@ public partial class ShareArkModule(
                 "ss=" + Uri.EscapeDataString(keyword.Trim())
                 + "&n=" + Math.Max(1, index).ToString(CultureInfo.InvariantCulture)
                 + "&format=json");
-            string body = await http.GetStringAsync(url);
+            string body = await Http.GetStringAsync(url);
             using JsonDocument doc = JsonDocument.Parse(body);
             JsonElement root = doc.RootElement;
             if (root.ValueKind != JsonValueKind.Object || ReadCode(root) != 200)
@@ -2692,7 +2801,7 @@ public partial class ShareArkModule(
             {
                 string url = WithQuery(baseUrl + path,
                     "ss=" + Uri.EscapeDataString(keyword) + "&format=json&t=5");
-                string body = await http.GetStringAsync(url);
+                string body = await Http.GetStringAsync(url);
                 using JsonDocument doc = JsonDocument.Parse(body);
                 JsonElement root = doc.RootElement;
                 if (root.ValueKind == JsonValueKind.Object && ReadCode(root) == 200)
@@ -2724,7 +2833,7 @@ public partial class ShareArkModule(
                 {
                     string url = WithQuery(baseUrl + "/a/qqmusic.php",
                         "nr=" + Uri.EscapeDataString(keyword) + "&return=json");
-                    string body = await http.GetStringAsync(url);
+                    string body = await Http.GetStringAsync(url);
                     using JsonDocument doc = JsonDocument.Parse(body);
                     JsonElement root = doc.RootElement;
                     if (root.ValueKind == JsonValueKind.Array && root.GetArrayLength() > 0)
@@ -2786,7 +2895,7 @@ public partial class ShareArkModule(
                 using var req = new HttpRequestMessage(HttpMethod.Get, "https://music.163.com/api/song/detail/?ids=[" + id + "]");
                 req.Headers.Referrer = new Uri("https://music.163.com/");
                 req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
-                string body = await (await http.SendAsync(req)).Content.ReadAsStringAsync();
+                string body = await (await Http.SendAsync(req)).Content.ReadAsStringAsync();
                 using var doc = JsonDocument.Parse(body);
                 var s = doc.RootElement.GetProperty("songs")[0];
                 info["song"] = s.GetProperty("name").GetString() ?? "未知歌曲";
@@ -2839,7 +2948,7 @@ public partial class ShareArkModule(
                 req.Headers.TryAddWithoutValidation("Accept", "application/json, text/plain, */*");
                 req.Headers.TryAddWithoutValidation("Cookie", "buvid3=1; b_nut=1");
                 req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
-                string body = await (await http.SendAsync(req)).Content.ReadAsStringAsync();
+                string body = await (await Http.SendAsync(req)).Content.ReadAsStringAsync();
                 using var doc = JsonDocument.Parse(body);
                 var dd = doc.RootElement.GetProperty("data");
                 string pic = dd.GetProperty("pic").GetString() ?? "";
@@ -2872,7 +2981,7 @@ public partial class ShareArkModule(
                 using var req = new HttpRequestMessage(HttpMethod.Get, u);
                 req.Headers.Referrer = new Uri("https://y.qq.com/");
                 req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
-                string body = await (await http.SendAsync(req)).Content.ReadAsStringAsync();
+                string body = await (await Http.SendAsync(req)).Content.ReadAsStringAsync();
                 using var doc = JsonDocument.Parse(body);
                 var dd = doc.RootElement.GetProperty("data")[0];
                 string albid = dd.GetProperty("album").GetProperty("mid").GetString() ?? "";
@@ -3050,7 +3159,7 @@ public partial class ShareArkModule(
             string body;
             try
             {
-                body = await http.GetStringAsync(fullUrl);
+                body = await Http.GetStringAsync(fullUrl);
             }
             catch (Exception requestError)
             {
@@ -3096,7 +3205,7 @@ public partial class ShareArkModule(
         string body;
         try
         {
-            body = await http.GetStringAsync(fullUrl);
+            body = await Http.GetStringAsync(fullUrl);
         }
         catch (Exception requestError)
         {
