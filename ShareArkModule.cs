@@ -551,13 +551,17 @@ public partial class ShareArkModule(
         var b = Configuration.BaseUrl;
         if (string.IsNullOrWhiteSpace(b))
             throw new Exception("第三方接口基地址没填，去模块配置里补上");
-        return b.Trim().TrimEnd('/');
+        return NormBase(b);
     }
     static readonly Dictionary<string, string[]> _cands = new()
     {
         ["ark"] = new[] { "qq-musicArk", "qq_musicark", "musicArk", "music-card" },
         ["share"] = new[] { "qq-shareArk", "qq_shareArk", "qq-shareark", "shareArk", "share-card" },
         ["s-163"] = new[] { "163-music-search", "163_music_search", "163-search", "music-search" },
+        // 咸鱼的搜索是三套独立路径；缺了这两组时 s-qq / s-kugou 会被拼成不存在的地址，
+        // 日志里表现为「搜索节点 主站·搜索 失败：404」，随后只能退回官方搜索
+        ["s-qq"] = new[] { "qq-music-search", "qq_music_search", "qq-search", "qqmusic-search" },
+        ["s-kugou"] = new[] { "kugou-music-search", "kugou_music_search", "kugou-search", "kugoumusic-search" },
     };
     static readonly Dictionary<string, string> _sfx = new();
     static bool _discovered; // 首页/openapi 路径发现只跑一次
@@ -579,7 +583,28 @@ public partial class ShareArkModule(
     static readonly Dictionary<string, string> _sfxBackup = new(); // key = 规范化base|role
     static readonly ConcurrentDictionary<string, (DateTime Until, string Reason)> NodeCooldowns = new();
 
-    static string NormBase(string url) => (url ?? "").Trim().TrimEnd('/');
+    static string NormBase(string url)
+    {
+        string b = (url ?? "").Trim().TrimEnd('/');
+        // 咸鱼文档页给的是域名根，所有接口实际挂在 /api/v1 下；只填根域名时自动补上
+        if (b.Length > 0)
+        {
+            try
+            {
+                Uri u = new(b);
+                if (u.Host.Equals("apii.xianyuw.cn", StringComparison.OrdinalIgnoreCase)
+                    && (u.AbsolutePath.Length == 0 || u.AbsolutePath == "/"))
+                {
+                    b += "/api/v1";
+                }
+            }
+            catch
+            {
+                // 不是合法 URI 就按原样用，交给后面的请求报错
+            }
+        }
+        return b;
+    }
 
     static IEnumerable<string> SplitConfigList(string raw)
     {
@@ -629,7 +654,12 @@ public partial class ShareArkModule(
         {
             return cached;
         }
-        return _cands.TryGetValue(role, out string[] cands) && cands.Length > 0 ? cands[0] : role;
+        if (_cands.TryGetValue(role, out string[]? cands) && cands.Length > 0)
+        {
+            return cands[0];
+        }
+        // 搜索角色统一按「平台-music-search」回落：缺候选表时也不会拼出一个不存在的 s-qq
+        return role.StartsWith("s-", StringComparison.Ordinal) ? role[2..] + "-music-search" : role;
     }
 
     async Task EnsureFitOnBaseAsync(SignProvider provider, string role)
@@ -830,7 +860,7 @@ public partial class ShareArkModule(
     // 手动地址覆盖了的不再探测
     bool Manual(string key) => (key == "ark" && !string.IsNullOrWhiteSpace(Configuration.MusicArkUrl))
         || (key == "share" && !string.IsNullOrWhiteSpace(Configuration.ShareArkUrl))
-        || (key == "s-163" && !string.IsNullOrWhiteSpace(Configuration.SearchUrl));
+        || (key.StartsWith("s-", StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(Configuration.SearchUrl));
 
     // 每个角色的探测参数：必须是完整合法请求，让正确端点回 code==200（错误包也带 code，不能认）
     static string ProbeOf(string key) => key == "ark"
@@ -1036,6 +1066,14 @@ public partial class ShareArkModule(
             rep.Add("  " + await ProbeNodeAsync(node, ProbeOf("share"), false));
         }
         foreach (SignNode node in await SearchNodesAsync("163"))
+        {
+            rep.Add("  " + await ProbeNodeAsync(node, "msg=test", false));
+        }
+        foreach (SignNode node in await SearchNodesAsync("qq"))
+        {
+            rep.Add("  " + await ProbeNodeAsync(node, "msg=test", false));
+        }
+        foreach (SignNode node in await SearchNodesAsync("kugou"))
         {
             rep.Add("  " + await ProbeNodeAsync(node, "msg=test", false));
         }
@@ -1409,8 +1447,8 @@ public partial class ShareArkModule(
             (bool Success, string Message) sent = await SendJsonAsync(target, isGroup, card);
             if (sent.Success)
             {
-                // 发卡成功不往上下文里塞系统推送：群里已经能看到卡片
                 logger.LogInformation("卡片已发出");
+                interactor.Poke("卡片已发出");
                 return;
             }
             thirdPartyError = sent.Message;
@@ -1435,8 +1473,8 @@ public partial class ShareArkModule(
             (bool Success, string Message) official = await SendSegmentsAsync(target, isGroup, segments);
             if (official.Success)
             {
-                // 成功就不 Poke：之前的失败详情会把上下文刷屏，日志里留一份即可
                 logger.LogInformation("卡片已发出（OneBot 音乐段兜底；json 卡片失败：{Third}）", Brief(thirdPartyError, 300));
+                interactor.Poke("卡片已发出（官方音乐段）");
                 return;
             }
             interactor.Poke("❌ 发卡片失败：json 卡片（" + Brief(thirdPartyError) + "）；官方音乐段（" + Brief(official.Message) + "）");
@@ -1497,6 +1535,7 @@ public partial class ShareArkModule(
             if (sent.Success)
             {
                 logger.LogInformation("分享卡已发出");
+                interactor.Poke("卡片已发出");
             }
             else
             {
@@ -2428,16 +2467,42 @@ public partial class ShareArkModule(
         }
         else if (platform == "kugou")
         {
-            using HttpRequestMessage request = new(HttpMethod.Get,
-                "https://mobilecdn.kugou.com/api/v3/search/song?format=json&pagesize=5&page=1&keyword=" + Uri.EscapeDataString(keyword));
-            request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
-            string kugouBody;
-            try
+            // 有的网络对 mobilecdn.kugou.com 的证书链不认（日志里就是 SSL 信任失败），
+            // 这条只查公开搜索结果、不带登录态，HTTPS 失败时退回 HTTP 再试一次
+            string path = "api/v3/search/song?format=json&pagesize=5&page=1&keyword=" + Uri.EscapeDataString(keyword);
+            string kugouBody = "";
+            Exception? kugouError = null;
+            foreach (string scheme in new[] { "https", "http" })
             {
-                using HttpResponseMessage kugou = await Http.SendAsync(request);
-                kugouBody = await kugou.Content.ReadAsStringAsync();
+                try
+                {
+                    using HttpRequestMessage request = new(HttpMethod.Get, scheme + "://mobilecdn.kugou.com/" + path);
+                    request.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
+                    using HttpResponseMessage kugou = await Http.SendAsync(request);
+                    if (!kugou.IsSuccessStatusCode)
+                    {
+                        kugouError = new Exception("HTTP " + (int)kugou.StatusCode);
+                        continue;
+                    }
+                    string body = await kugou.Content.ReadAsStringAsync();
+                    using (JsonDocument probe = JsonDocument.Parse(body))
+                    {
+                        if (!probe.RootElement.TryGetProperty("data", out _))
+                        {
+                            kugouError = new Exception("返回里没有 data");
+                            continue;
+                        }
+                    }
+                    kugouBody = body;
+                    kugouError = null;
+                    break;
+                }
+                catch (Exception error)
+                {
+                    kugouError = error;
+                }
             }
-            catch (Exception kugouError)
+            if (kugouError != null && kugouBody.Length == 0)
             {
                 throw new Exception("酷狗这个搜索接口在当前网络连不上（" + kugouError.Message.Split('\n')[0] + "），搜歌先换 163 或 qq");
             }
@@ -2886,7 +2951,21 @@ public partial class ShareArkModule(
                 req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
                 string body = await (await Http.SendAsync(req)).Content.ReadAsStringAsync();
                 using var doc = JsonDocument.Parse(body);
-                var s = doc.RootElement.GetProperty("songs")[0];
+                JsonElement songs = doc.RootElement.GetProperty("songs");
+                JsonElement s = songs[0];
+                // 详情接口偶尔会回多条（同名/专辑），按请求的 id 精确挑，别拿第一条凑数
+                if (long.TryParse(id, NumberStyles.Integer, CultureInfo.InvariantCulture, out long wantedId)
+                    && songs.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (JsonElement candidate in songs.EnumerateArray())
+                    {
+                        if (GetNumericField(candidate, "id") == wantedId)
+                        {
+                            s = candidate;
+                            break;
+                        }
+                    }
+                }
                 info["song"] = s.GetProperty("name").GetString() ?? "未知歌曲";
                 info["singer"] = string.Join("/", s.GetProperty("artists").EnumerateArray().Select(a => a.GetProperty("name").GetString()));
                 info["cover"] = s.TryGetProperty("album", out var alb) && alb.TryGetProperty("picUrl", out var pu) ? pu.GetString() ?? "" : "";
@@ -2972,7 +3051,24 @@ public partial class ShareArkModule(
                 req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
                 string body = await (await Http.SendAsync(req)).Content.ReadAsStringAsync();
                 using var doc = JsonDocument.Parse(body);
-                var dd = doc.RootElement.GetProperty("data")[0];
+                JsonElement dataArr = doc.RootElement.GetProperty("data");
+                JsonElement dd = dataArr[0];
+                if (dataArr.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (JsonElement candidate in dataArr.EnumerateArray())
+                    {
+                        string mid = GetStringField(candidate, "mid");
+                        if (mid.Length == 0)
+                        {
+                            mid = GetStringField(candidate, "songmid");
+                        }
+                        if (mid.Equals(id, StringComparison.OrdinalIgnoreCase))
+                        {
+                            dd = candidate;
+                            break;
+                        }
+                    }
+                }
                 string albid = dd.GetProperty("album").GetProperty("mid").GetString() ?? "";
                 info["song"] = dd.GetProperty("title").GetString() ?? "未知歌曲";
                 info["singer"] = string.Join("/", dd.GetProperty("singer").EnumerateArray().Select(a => a.GetProperty("name").GetString()));
