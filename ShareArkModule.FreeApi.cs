@@ -115,7 +115,7 @@ public partial class ShareArkModule
         {
             return;
         }
-        if (Uri.TryCreate(url.Trim(), UriKind.Absolute, out Uri? parsed) == false)
+        if (Uri.TryCreate(url.Trim(), UriKind.Absolute, out Uri parsed) == false)
         {
             throw new Exception("给个完整链接（要带 https://）");
         }
@@ -215,13 +215,13 @@ public partial class ShareArkModule
     async Task<string> GetHtmlAsync(string url)
     {
         string host = new Uri(url).Host.ToLowerInvariant();
-        string? key = FreeReferers.Keys.FirstOrDefault(known => host.EndsWith(known, StringComparison.OrdinalIgnoreCase));
+        string key = FreeReferers.Keys.FirstOrDefault(known => host.EndsWith(known, StringComparison.OrdinalIgnoreCase));
         return await GetStringAsync(url, key ?? host);
     }
     async Task<string> GetStringAsync(string url, string host)
     {
         TimeSpan timeout = TimeSpan.FromSeconds(Math.Clamp(Configuration.FreeSourceTimeoutSeconds, 3, 90));
-        string? referer = FreeReferers.TryGetValue(host, out string? known) ? known : null;
+        string referer = FreeReferers.TryGetValue(host, out string known) ? known : null;
         // 统一走 SafeFetchAsync：4MB 上限、逐跳校验重定向、拒绝二进制响应。
         // 按响应头/页面 meta 的 charset 解码：有些站回 text/html; charset=UTF-8（大写），
         // .NET 认不下；GBK 的站一律按 UTF-8 解会整页乱码

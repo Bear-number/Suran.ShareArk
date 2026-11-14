@@ -22,7 +22,7 @@ public sealed class ShareArkUI : ModuleUIBase<ShareArkModule, ShareArkConfig>
 
     bool probingBase;
     bool probingAll;
-    string? report;
+    string report;
 
     protected override void BuildRenderTree(RenderTreeBuilder b)
     {

@@ -24,16 +24,16 @@ public partial class ShareArkModule
     public async Task SendPlatformCard(
         [Description("链接（要带 https://）")] string url,
         [Description("目标群号或QQ号")] long? targetId = null,
-        [Description("group或private，默认group")] string? type = null,
-        [Description("标题，可留空自动抓")] string? title = null,
-        [Description("预览图URL，可留空自动抓")] string? preview = null)
+        [Description("group或private，默认group")] string type = null,
+        [Description("标题，可留空自动抓")] string title = null,
+        [Description("预览图URL，可留空自动抓")] string preview = null)
     {
         if (Gate(Configuration.EnableSendShareCard, "发通用分享卡"))
         {
             return;
         }
         string link = (url ?? "").Trim();
-        if (Uri.TryCreate(link, UriKind.Absolute, out Uri? parsed) == false)
+        if (Uri.TryCreate(link, UriKind.Absolute, out Uri parsed) == false)
         {
             throw new Exception("给个完整链接（要带 https://）");
         }
@@ -79,7 +79,7 @@ public partial class ShareArkModule
     }
 
     /// <summary>音乐平台与B站视频直接走 ark 卡：链接里一般就有 ID，不用再抓页面。</summary>
-    async Task<bool> TryArkRouteAsync(string url, string host, long? targetId, string? type)
+    async Task<bool> TryArkRouteAsync(string url, string host, long? targetId, string type)
     {
         if (targetId == null)
         {

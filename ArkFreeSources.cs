@@ -238,7 +238,7 @@ public static class ArkFreeSources
     /// 外部文本进提示词前的统一清洗：去标签、去控制字符与双向覆盖符、压成单行、限长。
     /// 外部内容只能当数据看，其中的"忽略以上指令"之类不该有机会变成命令。
     /// </summary>
-    public static string SafeText(string? value, int max)
+    public static string SafeText(string value, int max)
     {
         string text = value ?? "";
         if (text.Length == 0)
