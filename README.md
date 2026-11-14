@@ -37,7 +37,7 @@
 | B站搜索接口地址 | `BiliSearchUrl` | B站视频搜索接口完整地址，留空走官方接口。 | `""` |
 | 容灾·签名失败冷却秒 | `SignFailureCooldownSeconds` | 签名接口报错后，这么多秒内不再重试（直接走备用方案），避免每次点歌都白等三四秒。0 = 每次都试 | `300` |
 | 容灾·启用官方接口回退 | `EnableOfficialFallback` | 第三方接口失败时是否自动改用官方接口。 | `true` |
-| 容灾·备用签名基地址 | `BackupBaseUrls` | 第三方接口失败时是否自动改用官方接口。 | `""` |
+| 容灾·备用签名基地址 | `BackupBaseUrls` |  | `""` |
 | 容灾·启用公共音乐卡签名 | `EnableBuiltinMusicSign` | 主站与备用站都失败时，音乐卡再试 OIAPI 公共签名（免 key，实测可用）。分享卡没有公共备用，仍走图文兜底。 | `true` |
 | 容灾·公共音乐卡签名地址 | `BuiltinMusicArkUrl` | 默认 OIAPI 的 QQMusicJSONArk 接口；换服务时只改这一行。 | `"https://oiapi.net/api/QQMusicJSONArk"` |
 | 容灾·额外音乐卡签名地址 | `ExtraMusicSignUrls` | 完整地址，一行一个，可写 url\|key。适合 OIAPI 风格的第三方音乐卡签名（GET，参数 url/song/singer/cover/jump/format，format 用 163，成功码 0/200/1 都认）。 | `""` |
