@@ -586,13 +586,31 @@ public partial class ShareArkModule
             if (string.IsNullOrWhiteSpace(desc)) desc = title;
             if (string.IsNullOrWhiteSpace(prompt))
                 prompt = "[分享]" + title;
-            // 依次尝试主站 / 备用站；全失败才抛给下面的图文兜底
+            // 依次尝试主站 / 备用站；全失败才抛给下面的文本兜底
             string card = await SignShareCardAsync(title, desc, url, preview, prompt);
-            (bool Success, string Message) sent = await SendJsonAsync(target, isGroup, card);
+            (bool Success, string Message, bool Definite) sent = await SendJsonDetailedAsync(target, isGroup, card);
             if (sent.Success)
             {
                 logger.LogInformation("分享卡已发出");
                 interactor.Poke("卡片已发出");
+            }
+            else if (sent.Definite && Configuration.EnableOfficialFallback)
+            {
+                // 卡片签好了但协议端明确拒收/静默丢弃：卡片没了，至少把「标题 + 链接」发出去
+                logger.LogWarning("分享卡被协议端拒收（{Reason}），改发标题+链接文本", sent.Message);
+                (bool Success, string Message) plain = await SendLinkFallbackAsync(target, isGroup, title, url);
+                if (plain.Success)
+                {
+                    logger.LogInformation("分享卡已退成标题+链接文本发出");
+                    interactor.Poke("卡片被协议端拒收（" + Brief(sent.Message) + "），已退成「标题 + 链接」文本发出");
+                    return;
+                }
+                interactor.Poke("❌ 分享卡没发出去：" + Brief(sent.Message) + "；文本兜底（" + Brief(plain.Message) + "）");
+            }
+            else if (sent.Definite == false)
+            {
+                // 超时/断连：卡片可能已经送达，补发文本会让对方收到两条，这里只报状态
+                interactor.Poke("❌ 分享卡发送超时或断连（" + Brief(sent.Message) + "），消息可能已发出，请先确认再重试");
             }
             else
             {
@@ -604,18 +622,19 @@ public partial class ShareArkModule
             logger.LogWarning("发分享卡失败：" + ex.Message);
             bool signProblem = ex.Message.Contains("签名", StringComparison.Ordinal);
 
-            // 签名挂了的时候退成一条普通图文消息：卡片是没有了，但链接和图还在，
-            // 群里看到的仍然是「标题 + 预览图 + 链接」，比一句"发卡片失败"有用。
+            // 签名挂了的时候退成一条普通文本：卡片是没有了，但「标题 + 链接」还在，
+            // 群里至少点得动，比一句"发卡片失败"有用。
             if (signProblem && Configuration.EnableOfficialFallback)
             {
                 (bool Success, string Message) plain =
-                    await SendLinkFallbackAsync(target, isGroup, title, desc, url, preview);
+                    await SendLinkFallbackAsync(target, isGroup, title, url);
                 if (plain.Success)
                 {
-                    logger.LogInformation("分享卡已发出（签名不可用，退成图文消息）");
+                    logger.LogInformation("分享卡已发出（签名不可用，退成标题+链接文本）");
+                    interactor.Poke("卡片签名不可用，已退成「标题 + 链接」文本发出");
                     return;
                 }
-                interactor.Poke("❌ 分享卡没发成：签名（" + Brief(ex.Message) + "）；图文兜底（" + Brief(plain.Message) + "）");
+                interactor.Poke("❌ 分享卡没发成：签名（" + Brief(ex.Message) + "）；文本兜底（" + Brief(plain.Message) + "）");
                 return;
             }
 
@@ -706,42 +725,23 @@ public partial class ShareArkModule
     }
 
     /// <summary>
-    /// 签名不可用时的退路：预览图 + 文字，图不成再退纯文字。
-    ///
-    /// 只降级、不假装：消息段发成功才算成功，返回体里没有 message_id 一律当失败
-    /// （LLOneBot 对不认识的消息段不报错，直接丢）。
+    /// 签名不可用时的降级：只发「标题 + 链接」纯文本。
+    /// 不带预览图、不带描述——协议端拉图失败或字段过长都会把整条消息拖死，
+    /// 而这段兜底的全部意义是"至少把链接给出去"。
     /// </summary>
     async Task<(bool Success, string Message)> SendLinkFallbackAsync(
-        long target, bool isGroup, string title, string desc, string url, string preview)
+        long target, bool isGroup, string title, string link)
     {
-        string head = string.IsNullOrWhiteSpace(title) ? url : title.Trim();
-        if (head.Length > 60)
-            head = head[..60];
+        string head = (title ?? "").Trim();
+        string url = (link ?? "").Trim();
 
         StringBuilder body = new();
-        body.Append('【').Append(head).Append('】');
-        string sub = (desc ?? "").Trim().Replace('\n', ' ');
-        if (sub.Length > 0 && sub != head)
-        {
-            if (sub.Length > 120)
-                sub = sub[..120] + "…";
-            body.Append('\n').Append(sub);
-        }
-        body.Append('\n').Append(url);
-
-        // 预览图只在是 http(s) 地址时带上：data: 那种协议端读不了，会把整条消息拖死
-        if (!string.IsNullOrWhiteSpace(preview) && preview.Trim().StartsWith("http", StringComparison.OrdinalIgnoreCase))
-        {
-            JsonArray withImage = new()
-            {
-                new JsonObject { ["type"] = "image", ["data"] = new JsonObject { ["file"] = preview.Trim() } },
-                new JsonObject { ["type"] = "text", ["data"] = new JsonObject { ["text"] = body.ToString() } }
-            };
-            (bool Success, string Message) sent = await SendSegmentsAsync(target, isGroup, withImage);
-            if (sent.Success)
-                return sent;
-            logger.LogWarning("图文兜底失败，退纯文字：{Msg}", sent.Message);
-        }
+        // 标题就是链接本身时别发两遍
+        if (head.Length > 0 && string.Equals(head, url, StringComparison.Ordinal) == false)
+            body.Append(head).Append('\n');
+        body.Append(url);
+        if (body.Length == 0)
+            return (false, "没有可发的标题或链接");
 
         JsonArray textOnly = new()
         {
@@ -2461,6 +2461,14 @@ public partial class ShareArkModule
 
     async Task<(bool Success, string Message)> SendJsonAsync(long target, bool isGroup, string cardJson)
     {
+        (bool success, string message, _) = await SendJsonDetailedAsync(target, isGroup, cardJson);
+        return (success, message);
+    }
+
+    /// <summary>同上，但多回一个 Definite：true 表示协议端明确拒收/静默丢弃，消息肯定没发出去；
+    /// false 表示连接异常或超时，消息可能已经送达，不能再用文本补发（会重复）。</summary>
+    async Task<(bool Success, string Message, bool Definite)> SendJsonDetailedAsync(long target, bool isGroup, string cardJson)
+    {
         JsonObject jsonSegment = new()
         {
             ["type"] = "json",
@@ -2468,7 +2476,7 @@ public partial class ShareArkModule
         };
         JsonArray segments = new();
         segments.Add(jsonSegment);
-        return await SendSegmentsAsync(target, isGroup, segments);
+        return await SendSegmentsDetailedAsync(target, isGroup, segments);
     }
 
     string ProviderLabel() => providerName.Length > 0 ? providerName : "协议端";
@@ -2504,6 +2512,14 @@ public partial class ShareArkModule
     // LLOneBot 直接丢掉该段但照发其余内容并回 retcode 0——所以成功也必须验 message_id。
     async Task<(bool Success, string Message)> SendSegmentsAsync(long target, bool isGroup, JsonArray segments)
     {
+        (bool success, string message, _) = await SendSegmentsDetailedAsync(target, isGroup, segments);
+        return (success, message);
+    }
+
+    /// <summary>发送段消息并区分失败性质：协议端拒收 / 静默丢弃算 Definite（肯定没发出去），
+    /// 连接异常与超时算不确定——后者不能补发，否则用户会收到两条。</summary>
+    async Task<(bool Success, string Message, bool Definite)> SendSegmentsDetailedAsync(long target, bool isGroup, JsonArray segments)
+    {
         await ResolveProviderAsync();
         string action = isGroup ? "send_group_msg" : "send_private_msg";
         string idKey = isGroup ? "group_id" : "user_id";
@@ -2517,19 +2533,20 @@ public partial class ShareArkModule
             (int retcode, string message, JsonElement data) = await SendActionAsync(action, parameters);
             if (retcode != 0)
             {
-                return (false, ProviderLabel() + " 返回 " + retcode + "：" + message + FailureHint(retcode));
+                return (false, ProviderLabel() + " 返回 " + retcode + "：" + message + FailureHint(retcode), true);
             }
             // 三端成功都会带 message_id；回成功却没有它，说明这一段被静默丢弃了
             if (data.ValueKind != JsonValueKind.Object || data.TryGetProperty("message_id", out _) == false)
             {
                 return (false, ProviderLabel() + " 回成功但没给 message_id，卡片段很可能被静默丢弃"
-                    + "（LLOneBot 对不认识的消息段不报错直接丢；音乐卡片还需在 LLOneBot 里配置签名地址）");
+                    + "（LLOneBot 对不认识的消息段不报错直接丢；音乐卡片还需在 LLOneBot 里配置签名地址）", true);
             }
-            return (true, "");
+            return (true, "", true);
         }
         catch (Exception sendError)
         {
-            return (false, sendError.Message);
+            // 超时/断连：消息可能已经到了，交给调用方决定，不能当"肯定没发"处理
+            return (false, sendError.Message, false);
         }
     }
 
