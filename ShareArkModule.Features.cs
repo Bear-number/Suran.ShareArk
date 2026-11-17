@@ -2033,8 +2033,8 @@ public partial class ShareArkModule
             {
                 logger.LogWarning("网易云详情失败（id {Id}）：{Msg}", id, detailError.Message);
                 Dictionary<string, string> fallback = await SearchDetailFallbackAsync("163", id, "netease",
-                    "http://music.163.com/song?id=" + id,
-                    "http://music.163.com/song/media/outer/url?id=" + id + ".mp3");
+                    "https://music.163.com/song?id=" + id,
+                    "https://music.163.com/song/media/outer/url?id=" + id + ".mp3");
                 if (fallback != null)
                 {
                     logger.LogInformation("网易云详情已用第三方兜底（id {Id}）", id);
@@ -2050,8 +2050,8 @@ public partial class ShareArkModule
                     + "\n换个 id 或改用歌名搜索；接口被风控时过一会儿再试");
             }
             info["format"] = "netease";
-            info["url"] = "http://music.163.com/song/media/outer/url?id=" + id + ".mp3";
-            info["jump"] = "http://music.163.com/song?id=" + id;
+            info["url"] = "https://music.163.com/song/media/outer/url?id=" + id + ".mp3";
+            info["jump"] = "https://music.163.com/song?id=" + id;
         }
         else if (platform == "bilibili")
         {
