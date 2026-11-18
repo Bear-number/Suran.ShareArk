@@ -2587,6 +2587,11 @@ public partial class ShareArkModule
 
     async Task<(int Retcode, string Message, JsonElement Data)> SendActionOnceAsync(string action, JsonObject parameters)
     {
+        // 装了 Suran.QChat 就共用它的连接；没装/没启用才用下面的独立连接
+        object? sharedClient = ChatActivity == null ? null : SharedQChatBridge.FindClient(ChatActivity);
+        if (sharedClient != null)
+            return ParseSharedResponse(await SharedQChatBridge.CallRawAsync(sharedClient, action, parameters));
+
         if (_sharedWs == null || _sharedWs.State != WebSocketState.Open)
         {
             _sharedWs?.Dispose();
@@ -2629,18 +2634,23 @@ public partial class ShareArkModule
             {
                 continue;
             }
-            int retcode = doc.RootElement.TryGetProperty("retcode", out JsonElement retcodeElement)
-                && retcodeElement.ValueKind == JsonValueKind.Number ? retcodeElement.GetInt32() : -1;
-            string message = GetStringField(doc.RootElement, "message");
-            // SnowLuma 的失败包只填 wording，LLOneBot/NapCat 两个键都填
-            if (message.Length == 0)
-            {
-                message = GetStringField(doc.RootElement, "wording");
-            }
-            JsonElement data = doc.RootElement.TryGetProperty("data", out JsonElement dataElement)
-                ? dataElement.Clone() : JsonDocument.Parse("null").RootElement.Clone();
-            return (retcode, message, data);
+            return ParseSharedResponse(Encoding.UTF8.GetString(buffer.ToArray()));
         }
         throw new Exception("等协议端响应超时");
+    }
+
+    /// <summary>解析协议端动作响应：共享连接和独立连接返回格式一致，都走这里。</summary>
+    (int Retcode, string Message, JsonElement Data) ParseSharedResponse(string responseText)
+    {
+        using JsonDocument doc = JsonDocument.Parse(responseText);
+        int retcode = doc.RootElement.TryGetProperty("retcode", out JsonElement retcodeElement)
+            && retcodeElement.ValueKind == JsonValueKind.Number ? retcodeElement.GetInt32() : -1;
+        string message = GetStringField(doc.RootElement, "message");
+        // SnowLuma 的失败包只填 wording，LLOneBot/NapCat 两个键都填
+        if (message.Length == 0)
+            message = GetStringField(doc.RootElement, "wording");
+        JsonElement data = doc.RootElement.TryGetProperty("data", out JsonElement dataElement)
+            ? dataElement.Clone() : JsonDocument.Parse("null").RootElement.Clone();
+        return (retcode, message, data);
     }
 }
