@@ -175,18 +175,24 @@ public partial class ShareArkModule
         {
             return "未启用（容灾·启用公共音乐平台接口 是关的）";
         }
-        try
+        string luoSuBase = (Configuration.LuoSuBaseUrl ?? "").Trim().TrimEnd('/');
+        // 三个平台各打一次：洛苏 QQ 的 cookie 池常失效，只报 QQ 会让人以为整个洛苏都挂了
+        foreach (string pf in new[] { "163", "kugou", "qq" })
         {
-            string url = WithQuery((Configuration.LuoSuBaseUrl ?? "").Trim().TrimEnd('/') + "/api/qqmusic/",
-                "ss=" + Uri.EscapeDataString("晴天") + "&format=json&t=2");
-            string body = await Http.GetStringAsync(url);
-            using JsonDocument doc = JsonDocument.Parse(body);
-            bool ok = doc.RootElement.ValueKind == JsonValueKind.Object && ReadCode(doc.RootElement) == 200;
-            parts.Add("洛苏 QQ " + (ok ? "通" : "不通（code=" + ReadCode(doc.RootElement) + "）"));
-        }
-        catch (Exception error)
-        {
-            parts.Add("洛苏 QQ 不通（" + error.Message + "）");
+            string path = LuoSuPath(pf);
+            try
+            {
+                string url = WithQuery(luoSuBase + path,
+                    "ss=" + Uri.EscapeDataString("晴天") + "&n=1&format=json");
+                string body = await Http.GetStringAsync(url);
+                using JsonDocument doc = JsonDocument.Parse(body);
+                bool ok = doc.RootElement.ValueKind == JsonValueKind.Object && ReadCode(doc.RootElement) == 200;
+                parts.Add("洛苏 " + pf + " " + (ok ? "通" : "不通（code=" + ReadCode(doc.RootElement) + "）"));
+            }
+            catch (Exception error)
+            {
+                parts.Add("洛苏 " + pf + " 不通（" + error.Message + "）");
+            }
         }
         try
         {
@@ -200,6 +206,62 @@ public partial class ShareArkModule
         catch (Exception error)
         {
             parts.Add("糖豆子 QQ 不通（" + error.Message + "）");
+        }
+        // GD Studio：搜索 + 直链条都打一遍，只有直链能播才算真能用
+        if (Configuration.EnableGdStudioMusic)
+        {
+            List<ArkPublicSong> gd = await GdStudioSearchAsync("晴天", 1);
+            if (gd.Count == 0)
+            {
+                parts.Add("GD Studio 不通");
+            }
+            else
+            {
+                try
+                {
+                    string body = await Http.GetStringAsync(ArkPublicMusic.GdUrlUrl(GdApi, ArkPublicMusic.GdSourceNetease, gd[0].Id));
+                    using JsonDocument doc = JsonDocument.Parse(body);
+                    string play = ArkPublicMusic.ParseGdUrl(doc.RootElement);
+                    parts.Add("GD Studio " + (play.Length > 0 ? "通（搜到 " + gd[0].Name + "，有直链）" : "搜索通但没给直链"));
+                }
+                catch (Exception error)
+                {
+                    parts.Add("GD Studio 直链不通（" + error.Message + "）");
+                }
+            }
+        }
+        else
+        {
+            parts.Add("GD Studio 未启用");
+        }
+        if (Configuration.EnableVKeysMusic)
+        {
+            List<ArkPublicSong> vk163 = await VKeysSearchAsync(ArkPublicMusic.VKeysNetease, "晴天");
+            List<ArkPublicSong> vkQq = await VKeysSearchAsync(ArkPublicMusic.VKeysTencent, "晴天");
+            parts.Add("VKeys " + (vk163.Count > 0 || vkQq.Count > 0
+                ? "通（网易云 " + vk163.Count + " 条，QQ " + vkQq.Count + " 条）"
+                : "不通或回空"));
+        }
+        else
+        {
+            parts.Add("VKeys 未启用");
+        }
+        if (Configuration.EnableKuwoMusic)
+        {
+            List<ArkPublicSong> kuwo = await KuwoSearchAsync("晴天", 1);
+            if (kuwo.Count == 0)
+            {
+                parts.Add("酷我 不通");
+            }
+            else
+            {
+                string play = await KuwoPlayUrlAsync(kuwo[0].Id);
+                parts.Add("酷我 " + (play.Length > 0 ? "通（搜到 " + kuwo[0].Name + "，有直链）" : "搜索通但没给直链"));
+            }
+        }
+        else
+        {
+            parts.Add("酷我 未启用");
         }
         return string.Join("；", parts);
     }
@@ -340,14 +402,15 @@ public partial class ShareArkModule
         }
         catch (Exception thirdPartyError)
         {
+            // 顺序固定：签名主站 → 公共免费接口（洛苏/糖豆子）→ 官方
+            string publicLines = await PublicMusicSearchLinesAsync(pf, keyword);
+            if (publicLines != null)
+            {
+                interactor.Poke("ℹ️ 第三方接口不可用（" + thirdPartyError.Message + "），已用公共音乐接口。\n" + publicLines);
+                return;
+            }
             if (Configuration.EnableOfficialFallback == false)
             {
-                string publicLines = await PublicMusicSearchLinesAsync(pf, keyword);
-                if (publicLines != null)
-                {
-                    interactor.Poke("ℹ️ 第三方接口不可用（" + thirdPartyError.Message + "），已用公共音乐接口。\n" + publicLines);
-                    return;
-                }
                 interactor.Poke("搜索失败：" + thirdPartyError.Message);
                 return;
             }
@@ -356,17 +419,10 @@ public partial class ShareArkModule
                 List<(string Id, string Name, string Singer)> results = await OfficialSearchAsync(pf, keyword);
                 List<string> lines = results.Select(r => r.Id + " | " + r.Name + (r.Singer.Length > 0 ? " - " + r.Singer : "")).ToList();
                 if (lines.Count == 0) lines.Add("没搜到");
-                interactor.Poke("ℹ️ 第三方接口不可用（" + thirdPartyError.Message + "），已切换官方接口。\n" + string.Join("\n", lines));
+                interactor.Poke("ℹ️ 第三方与公共音乐接口都不可用，已切换官方接口。\n" + string.Join("\n", lines));
             }
             catch (Exception officialError)
             {
-                string publicLines = await PublicMusicSearchLinesAsync(pf, keyword);
-                if (publicLines != null)
-                {
-                    interactor.Poke("ℹ️ 第三方与官方都不可用，已切公共音乐接口（第三方：" + thirdPartyError.Message
-                        + "；官方：" + officialError.Message + "）。\n" + publicLines);
-                    return;
-                }
                 interactor.Poke("❌ 搜索：第三方（" + thirdPartyError.Message + "）；官方容灾（" + officialError.Message + "）");
             }
         }
@@ -454,31 +510,102 @@ public partial class ShareArkModule
                 logger.LogWarning("B站第三方搜索失败，转官方搜索：" + thirdPartyError.Message);
             }
         }
-        string ou = "https://api.bilibili.com/x/web-interface/search/all/v2?keyword=" + Uri.EscapeDataString(keyword);
-        using var req = new HttpRequestMessage(HttpMethod.Get, ou);
-        req.Headers.Referrer = new Uri("https://www.bilibili.com/");
-        req.Headers.TryAddWithoutValidation("Cookie", "buvid3=1; b_nut=1");
-        req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
-        string obody = await (await Http.SendAsync(req)).Content.ReadAsStringAsync();
-        using var odoc = JsonDocument.Parse(obody);
-        // B站成功也是 code:0，和签名接口的 200 不一样；被风控时回 -412 且没有 data.result，
-        // 原来直接 GetProperty 会抛 KeyNotFoundException，报错里看不出是"被限流"还是"没搜到"
-        if (!odoc.RootElement.TryGetProperty("code", out var oc) || oc.GetInt32() != 0)
+        return await OfficialBiliSearchAsync(keyword);
+    }
+
+    /// <summary>官方搜索两个端点互备：all/v2 一次给全部分区，被风控（-412）时换 search/type 再试</summary>
+    async Task<List<(string bv, string title)>> OfficialBiliSearchAsync(string keyword)
+    {
+        string[] endpoints =
+        [
+            "https://api.bilibili.com/x/web-interface/search/all/v2?keyword=" + Uri.EscapeDataString(keyword),
+            "https://api.bilibili.com/x/web-interface/wbi/search/type?search_type=video&page=1&keyword=" + Uri.EscapeDataString(keyword),
+        ];
+        string lastError = "B站官方搜索没有可用端点";
+        foreach (string endpoint in endpoints)
         {
-            string om = odoc.RootElement.TryGetProperty("message", out var omm) ? omm.GetString() ?? "" : "";
-            throw new Exception("B站官方搜索失败（code=" + (odoc.RootElement.TryGetProperty("code", out var c1) ? c1.GetInt32().ToString() : "?")
-                + (om.Length > 0 ? "，" + om : "") + "）"
-                + (string.IsNullOrWhiteSpace(Configuration.BiliSearchUrl)
-                    ? "，可以在配置里填 BiliSearchUrl 走第三方搜索"
-                    : "（第三方搜索这次也没成功）"));
+            try
+            {
+                using HttpRequestMessage req = new(HttpMethod.Get, endpoint);
+                req.Headers.Referrer = new Uri("https://www.bilibili.com/");
+                req.Headers.TryAddWithoutValidation("Cookie", "buvid3=1; b_nut=1");
+                req.Headers.TryAddWithoutValidation("User-Agent", BrowserUserAgent);
+                string body = await (await Http.SendAsync(req)).Content.ReadAsStringAsync();
+                using JsonDocument doc = JsonDocument.Parse(body);
+                // B站成功码是 0，被风控时回 -412 且没有 data.result
+                bool hasCode = doc.RootElement.TryGetProperty("code", out JsonElement code)
+                    && code.ValueKind == JsonValueKind.Number;
+                if (!hasCode || code.GetInt32() != 0
+                    || !doc.RootElement.TryGetProperty("data", out JsonElement data))
+                {
+                    string msg = doc.RootElement.TryGetProperty("message", out JsonElement m) ? m.GetString() ?? "" : "";
+                    throw new Exception("回 code=" + (hasCode ? code.GetInt32().ToString(CultureInfo.InvariantCulture) : "?")
+                        + (msg.Length > 0 ? "，" + msg : ""));
+                }
+                List<(string, string)> hits = ParseBiliSearchData(data);
+                if (hits.Count > 0)
+                {
+                    return hits;
+                }
+                lastError = "搜索没结果";
+            }
+            catch (Exception error)
+            {
+                lastError = error.Message;
+                logger.LogWarning("B站官方搜索端点失败（{Endpoint}）：{Msg}", endpoint.Split('?')[0], error.Message);
+            }
         }
-        foreach (var sec in odoc.RootElement.GetProperty("data").GetProperty("result").EnumerateArray())
+        throw new Exception("B站官方搜索失败（" + lastError + "）"
+            + (string.IsNullOrWhiteSpace(Configuration.BiliSearchUrl)
+                ? "，可以在配置里填 BiliSearchUrl 走第三方搜索"
+                : "（第三方搜索这次也没成功）"));
+    }
+
+    // all/v2 的结果按分区包一层（result_type=video 里才是视频），search/type 直接就是视频数组
+    static List<(string, string)> ParseBiliSearchData(JsonElement data)
+    {
+        List<(string, string)> list = new();
+        if (data.ValueKind != JsonValueKind.Object || !data.TryGetProperty("result", out JsonElement result)
+            || result.ValueKind != JsonValueKind.Array)
         {
-            if (sec.GetProperty("result_type").GetString() != "video") continue;
-            foreach (var v in sec.GetProperty("data").EnumerateArray())
-                list.Add((v.GetProperty("bvid").GetString() ?? "", Regex.Replace(v.GetProperty("title").GetString() ?? "", "<[^>]*>", "")));
+            return list;
+        }
+        foreach (JsonElement node in result.EnumerateArray())
+        {
+            if (node.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+            if (node.TryGetProperty("result_type", out JsonElement type))
+            {
+                if (type.GetString() != "video"
+                    || !node.TryGetProperty("data", out JsonElement inner) || inner.ValueKind != JsonValueKind.Array)
+                {
+                    continue;
+                }
+                foreach (JsonElement video in inner.EnumerateArray())
+                {
+                    AddBiliHit(list, video);
+                }
+                continue;
+            }
+            AddBiliHit(list, node);
         }
         return list;
+    }
+
+    static void AddBiliHit(List<(string, string)> list, JsonElement video)
+    {
+        if (video.ValueKind != JsonValueKind.Object)
+        {
+            return;
+        }
+        string bv = video.TryGetProperty("bvid", out JsonElement b) ? b.GetString() ?? "" : "";
+        string title = video.TryGetProperty("title", out JsonElement t) ? Regex.Replace(t.GetString() ?? "", "<[^>]*>", "") : "";
+        if (bv.Length > 0)
+        {
+            list.Add((bv, title));
+        }
     }
 
     [XmlFunction(FunctionMode.OneShot)]
@@ -1706,6 +1833,18 @@ public partial class ShareArkModule
             }
         }
         catch (Exception ex) { logger.LogWarning("抓网页meta失败：" + ex.Message); }
+        // 自抓没拿到标题：再用 OIAPI 的网页信息接口补一次（免 key、国内直连，只给文字）
+        if (string.IsNullOrWhiteSpace(m.title) && Configuration.EnableOiApiMeta)
+        {
+            try
+            {
+                ArkLinkInfo viaOi = ArkFreeSources.ParseOiApiWebInfo(
+                    await GetJsonAsync(ArkFreeSources.OiApiWebInfoUrl(url), "oiapi.net"), url);
+                m.title = viaOi.Title;
+                if (string.IsNullOrWhiteSpace(m.desc)) m.desc = viaOi.Description;
+            }
+            catch (Exception oiError) { logger.LogWarning("OIAPI 抓网页meta失败：" + oiError.Message); }
+        }
         // 页面抓不到（超时/被墙）也必须给非空预览：签名端空值当缺参，直接用站点favicon
         if (string.IsNullOrWhiteSpace(m.image))
         {
@@ -1715,7 +1854,7 @@ public partial class ShareArkModule
         return m;
     }
 
-    // 传歌名不是ID时统一走搜索接口拿第一条：先试第三方多节点，全失败再走官方搜索
+    // 传歌名不是ID时统一走搜索接口拿第一条：第三方多节点 → 公共免费源 → 官方搜索
     async Task<(string id, string title, string author, string cover)> SearchFirstAsync(string pf, string kw)
     {
         try
@@ -1731,15 +1870,59 @@ public partial class ShareArkModule
         }
         catch (Exception thirdPartyError)
         {
-            // 第三方搜索全挂时，用官方搜索兜住；官方没有封面字段，后面详情接口会补
+            ArkPublicSong publicHit = await PublicFirstSongAsync(pf, kw);
+            if (publicHit != null)
+            {
+                logger.LogInformation("按歌名找 id 用了公共免费源（{Source} {Keyword}）", publicHit.Source, kw);
+                return (publicHit.Id, publicHit.Name, publicHit.Artist, publicHit.Cover);
+            }
+            // 公共源也没结果时才用官方搜索兜住；官方没有封面字段，后面详情接口会补
             List<(string Id, string Name, string Singer)> official = await OfficialSearchAsync(pf, kw);
             if (official.Count == 0)
             {
-                throw new Exception("搜索没结果（第三方：" + thirdPartyError.Message + "；官方也没搜到）");
+                throw new Exception("搜索没结果（第三方：" + thirdPartyError.Message + "；公共源、官方也没搜到）");
             }
             (string Id, string Name, string Singer) first = official[0];
             return (first.Id, first.Name, first.Singer, "");
         }
+    }
+
+    // 公共免费源的第一条：163 走 GD Studio → VKeys，qq 走 VKeys；酷狗没有可用的公共搜索源
+    async Task<ArkPublicSong> PublicFirstSongAsync(string pf, string keyword)
+    {
+        if ((keyword ?? "").Trim().Length == 0)
+        {
+            return null;
+        }
+        if (pf == "163")
+        {
+            if (Configuration.EnableGdStudioMusic)
+            {
+                List<ArkPublicSong> gd = await GdStudioSearchAsync(keyword, 1);
+                if (gd.Count > 0)
+                {
+                    return gd[0];
+                }
+            }
+            if (Configuration.EnableVKeysMusic)
+            {
+                List<ArkPublicSong> vk = await VKeysSearchAsync(ArkPublicMusic.VKeysNetease, keyword);
+                if (vk.Count > 0)
+                {
+                    return vk[0];
+                }
+            }
+            return null;
+        }
+        if (pf == "qq" && Configuration.EnableVKeysMusic)
+        {
+            List<ArkPublicSong> vk = await VKeysSearchAsync(ArkPublicMusic.VKeysTencent, keyword);
+            if (vk.Count > 0)
+            {
+                return vk[0];
+            }
+        }
+        return null;
     }
 
     // 详情接口的第三方兜底：用第三方搜索端的 id= 参数再问一次（不同平台返回形状不一，做宽松映射）
@@ -1768,6 +1951,12 @@ public partial class ShareArkModule
             string link = Field(d, "link", "jump", "jump_url");
             if (title.Length == 0 || singer.Length == 0)
             {
+                return null;
+            }
+            // 节点忽略 id 参数时会按别的方式返回一条，链接里对不上 id 就不是这首歌，宁可不给
+            if (id.Length >= 6 && link.Length > 0 && link.IndexOf(id, StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                logger.LogWarning("详情返回的链接对不上 id（{Platform} {Id} -> {Link}），丢弃", pf, id, link);
                 return null;
             }
             return new Dictionary<string, string>
@@ -1973,7 +2162,44 @@ public partial class ShareArkModule
                 logger.LogWarning("糖豆子API 搜歌失败：{Msg}", tangError.Message);
             }
         }
-        return null;
+        return await ExtraPublicSearchLinesAsync(pf, keyword);
+    }
+
+    // 再加几家：GD Studio（网易云）与 VKeys（网易云/QQ），只补搜索、按各自平台给可用的 id
+    async Task<string> ExtraPublicSearchLinesAsync(string pf, string keyword)
+    {
+        List<ArkPublicSong> hits = new();
+        string name = "";
+        if (pf == "163")
+        {
+            hits = await GdStudioSearchAsync(keyword, 5);
+            name = "GD Studio";
+            if (hits.Count == 0)
+            {
+                hits = await VKeysSearchAsync(ArkPublicMusic.VKeysNetease, keyword);
+                name = "VKeys";
+            }
+        }
+        else if (pf == "qq")
+        {
+            hits = await VKeysSearchAsync(ArkPublicMusic.VKeysTencent, keyword);
+            name = "VKeys";
+        }
+        if (hits.Count > 0)
+        {
+            List<string> lines = new() { name + "：" };
+            lines.AddRange(hits.Take(5).Select(hit => hit.Line()));
+            return string.Join("\n", lines);
+        }
+        // 酷我的 id 不是网易云/QQ 的 id，当 id 发卡会串歌，所以只给歌名让人当关键词用
+        List<ArkPublicSong> kuwo = await KuwoSearchAsync(keyword, 5);
+        if (kuwo.Count == 0)
+        {
+            return null;
+        }
+        List<string> kuwoLines = new() { "酷我（曲库不同，用这些歌名当关键词发卡）：" };
+        kuwoLines.AddRange(kuwo.Take(5).Select(hit => hit.Name + (hit.Artist.Length > 0 ? " - " + hit.Artist : "")));
+        return string.Join("\n", kuwoLines);
     }
 
     static JsonElement JsonValueOrDefault(JsonElement root, params string[] path)
@@ -1997,14 +2223,49 @@ public partial class ShareArkModule
         platform = (platform ?? "163").Trim().ToLowerInvariant();
         if (platform == "163")
         {
+            if (!id.All(char.IsDigit))
+            {
+                var r = await SearchFirstAsync("163", id);
+                id = r.id;
+                if (string.IsNullOrWhiteSpace(title)) title = r.title;
+            }
+            string jumpUrl = "https://music.163.com/song?id=" + id;
+            string outerUrl = "https://music.163.com/song/media/outer/url?id=" + id + ".mp3";
+
+            // 顺序固定：签名主站 → 公共免费接口（洛苏 / GD Studio）→ 官方详情
+            Dictionary<string, string> sign = await SearchDetailFallbackAsync("163", id, "netease", jumpUrl, outerUrl);
+            if (sign != null)
+            {
+                logger.LogInformation("网易云详情走签名站（id {Id}）", id);
+                return sign;
+            }
+            Dictionary<string, string> luosu = await LuoSuSongAsync("163", original);
+            if (luosu != null)
+            {
+                logger.LogInformation("网易云详情已用洛苏API兜底（{Keyword}）", original);
+                return luosu;
+            }
+            Dictionary<string, string> gd = await GdStudioSongAsync(original);
+            if (gd != null)
+            {
+                logger.LogInformation("网易云详情已用 GD Studio 兜底（{Keyword}）", original);
+                return gd;
+            }
+            // 酷我不能按网易云 id 查，拿不到歌名就跳过（纯数字 id 又没给 title 时搜出来的是别的歌）
+            string kuwoKeyword = original.All(char.IsDigit)
+                ? (title ?? "").Trim()
+                : original;
+            if (kuwoKeyword.Length > 0)
+            {
+                Dictionary<string, string> kuwo = await KuwoSongAsync(kuwoKeyword, "netease");
+                if (kuwo != null)
+                {
+                    logger.LogInformation("网易云详情已用酷我兜底（{Keyword}）", kuwoKeyword);
+                    return kuwo;
+                }
+            }
             try
             {
-                if (!id.All(char.IsDigit))
-                {
-                    var r = await SearchFirstAsync("163", id);
-                    id = r.id;
-                    if (string.IsNullOrWhiteSpace(title)) title = r.title;
-                }
                 using var req = new HttpRequestMessage(HttpMethod.Get, "https://music.163.com/api/song/detail/?ids=[" + id + "]");
                 req.Headers.Referrer = new Uri("https://music.163.com/");
                 req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
@@ -2032,26 +2293,12 @@ public partial class ShareArkModule
             catch (Exception detailError)
             {
                 logger.LogWarning("网易云详情失败（id {Id}）：{Msg}", id, detailError.Message);
-                Dictionary<string, string> fallback = await SearchDetailFallbackAsync("163", id, "netease",
-                    "https://music.163.com/song?id=" + id,
-                    "https://music.163.com/song/media/outer/url?id=" + id + ".mp3");
-                if (fallback != null)
-                {
-                    logger.LogInformation("网易云详情已用第三方兜底（id {Id}）", id);
-                    return fallback;
-                }
-                Dictionary<string, string> luosu = await LuoSuSongAsync("163", original);
-                if (luosu != null)
-                {
-                    logger.LogInformation("网易云详情已用洛苏API兜底（{Keyword}）", original);
-                    return luosu;
-                }
-                throw new Exception("拿不到网易云歌曲详情（id " + id + "）：" + detailError.Message
-                    + "\n换个 id 或改用歌名搜索；接口被风控时过一会儿再试");
+                throw new Exception("拿不到网易云歌曲详情（id " + id + "）：签名站、洛苏、GD Studio、官方详情都没拿到——"
+                    + detailError.Message + "\n换个 id 或改用歌名搜索；接口被风控时过一会儿再试");
             }
             info["format"] = "netease";
-            info["url"] = "https://music.163.com/song/media/outer/url?id=" + id + ".mp3";
-            info["jump"] = "https://music.163.com/song?id=" + id;
+            info["url"] = outerUrl;
+            info["jump"] = jumpUrl;
         }
         else if (platform == "bilibili")
         {
@@ -2096,14 +2343,50 @@ public partial class ShareArkModule
         }
         else if (platform == "qq")
         {
+            if (id.Length != 14)
+            {
+                var r = await SearchFirstAsync("qq", id);
+                if (!string.IsNullOrWhiteSpace(r.id)) id = r.id;
+                if (string.IsNullOrWhiteSpace(title)) title = r.title;
+            }
+            string jumpUrl = "https://y.qq.com/n/ryqq/songDetail/" + id;
+
+            // 顺序固定：签名主站 → 洛苏 → VKeys → 官方详情
+            Dictionary<string, string> sign = await SearchDetailFallbackAsync("qq", id, "qq", jumpUrl, "");
+            if (sign != null)
+            {
+                // 签名站不给播放地址时用详情页顶上，空值会被签名端当缺参
+                if (string.IsNullOrWhiteSpace(sign.GetValueOrDefault("url"))) sign["url"] = jumpUrl;
+                logger.LogInformation("QQ音乐详情走签名站（{Id}）", id);
+                return sign;
+            }
+            Dictionary<string, string> luosu = await LuoSuSongAsync("qq", original);
+            if (luosu != null)
+            {
+                logger.LogInformation("QQ音乐详情已用洛苏API兜底（{Keyword}）", original);
+                return luosu;
+            }
+            // 酷我给 mp3 直链，比 VKeys 的纯元数据实用；songmid 查不了酷我，只能用歌名
+            bool originalIsSongMid = original.Length == 14 && original.All(char.IsLetterOrDigit);
+            string kuwoKeyword = originalIsSongMid ? (title ?? "").Trim() : original;
+            if (kuwoKeyword.Length > 0)
+            {
+                Dictionary<string, string> kuwo = await KuwoSongAsync(kuwoKeyword, "qq");
+                if (kuwo != null)
+                {
+                    logger.LogInformation("QQ音乐详情已用酷我兜底（{Keyword}）", kuwoKeyword);
+                    return kuwo;
+                }
+            }
+            // 洛苏 QQ 的 cookie 池常失效：再用 VKeys 拿元数据与封面，卡片按跳转处理
+            Dictionary<string, string> vkeys = await VKeysSongAsync(original);
+            if (vkeys != null)
+            {
+                logger.LogInformation("QQ音乐详情已用 VKeys 兜底（{Keyword}）", original);
+                return vkeys;
+            }
             try
             {
-                if (id.Length != 14)
-                {
-                    var r = await SearchFirstAsync("qq", id);
-                    if (!string.IsNullOrWhiteSpace(r.id)) id = r.id;
-                    if (string.IsNullOrWhiteSpace(title)) title = r.title;
-                }
                 string u = "https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg?songmid=" + id + "&platform=yqq&format=json&inCharset=utf8&outCharset=utf-8";
                 using var req = new HttpRequestMessage(HttpMethod.Get, u);
                 req.Headers.Referrer = new Uri("https://y.qq.com/");
@@ -2136,24 +2419,11 @@ public partial class ShareArkModule
             catch (Exception detailError)
             {
                 logger.LogWarning("QQ音乐详情失败（{Id}）：{Msg}", id, detailError.Message);
-                Dictionary<string, string> fallback = await SearchDetailFallbackAsync("qq", id, "qq",
-                    "https://y.qq.com/n/ryqq/songDetail/" + id, "");
-                if (fallback != null)
-                {
-                    logger.LogInformation("QQ音乐详情已用第三方兜底（{Id}）", id);
-                    return fallback;
-                }
-                Dictionary<string, string> luosu = await LuoSuSongAsync("qq", original);
-                if (luosu != null)
-                {
-                    logger.LogInformation("QQ音乐详情已用洛苏API兜底（{Keyword}）", original);
-                    return luosu;
-                }
-                throw new Exception("拿不到 QQ音乐歌曲详情（" + id + "）：" + detailError.Message
-                    + "\n确认 songmid 是否正确，或改用歌名搜索");
+                throw new Exception("拿不到 QQ音乐歌曲详情（" + id + "）：签名站、洛苏、VKeys、官方详情都没拿到——"
+                    + detailError.Message + "\n确认 songmid 是否正确，或改用歌名搜索");
             }
-            info["url"] = "https://y.qq.com/n/ryqq/songDetail/" + id;
-            info["jump"] = "https://y.qq.com/n/ryqq/songDetail/" + id;
+            info["url"] = jumpUrl;
+            info["jump"] = jumpUrl;
             info["format"] = "qq";
         }
         else if (platform == "kugou")
@@ -2186,6 +2456,18 @@ public partial class ShareArkModule
                     logger.LogInformation("酷狗详情已用洛苏API兜底（{Keyword}）", original);
                     return luosu;
                 }
+                // hash 查不了酷我，只能用歌名
+                bool originalIsHash = Regex.IsMatch(original, "^[0-9A-Fa-f]{32}$");
+                string kuwoKeyword = originalIsHash ? (title ?? "").Trim() : original;
+                if (kuwoKeyword.Length > 0)
+                {
+                    Dictionary<string, string> kuwo = await KuwoSongAsync(kuwoKeyword, "kugou");
+                    if (kuwo != null)
+                    {
+                        logger.LogInformation("酷狗详情已用酷我兜底（{Keyword}）", kuwoKeyword);
+                        return kuwo;
+                    }
+                }
                 throw new Exception("拿不到酷狗歌曲详情（hash " + id + "）：" + detailError.Message
                     + "\n没有播放地址和封面就没法发音乐卡，确认 hash 或改用歌名搜索");
             }
@@ -2209,6 +2491,12 @@ public partial class ShareArkModule
     async Task<string> SignAsync(string platform, string id, string title)
     {
         var info = await ResolveInfoAsync(platform, id, title);
+        // 死链签出来的卡点开没声音：先探一次，播不了就换源（B站是视频页，不用探）
+        if (!string.Equals(info.GetValueOrDefault("format"), "bilibili", StringComparison.OrdinalIgnoreCase))
+        {
+            info["url"] = await RepairPlayUrlAsync(info.GetValueOrDefault("url"), info.GetValueOrDefault("jump"),
+                info.GetValueOrDefault("song"), info.GetValueOrDefault("singer"));
+        }
         // 签名端所有参数必填且空值当缺失：封面为空时回落抓播放页的 og:image。
         // 免费源关掉就不抓页面，行为要跟开关一致
         if (string.IsNullOrWhiteSpace(info.GetValueOrDefault("cover")) && Configuration.EnableFreeSources)

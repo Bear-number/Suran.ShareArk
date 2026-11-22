@@ -14,6 +14,7 @@ using System.Threading.Tasks;
 using Alife.Foundation;
 using Alife.Function.FunctionCaller;
 using Alife.Framework;
+using Microsoft.Extensions.Logging;
 
 namespace Suran.ShareArk;
 
@@ -30,6 +31,7 @@ public partial class ShareArkModule
 
     [XmlFunction(FunctionMode.OneShot)]
     [Description("取歌词（免费公开接口，不要 key）：带时间轴的优先走 LRCLIB，给了 neteaseId 或 song 是纯数字就走网易云官方接口。"
+        + "两者都没命中时再试 GD Studio 与洛苏。"
         + "duration 传秒数能大幅提高 LRCLIB 命中率；歌词全文会另存一份到本地，方便之后朗读或做字幕")]
     public async Task ArkLyric(string song, string artist = "", int duration = 0, string neteaseId = "")
     {
@@ -74,6 +76,20 @@ public partial class ShareArkModule
         }
         catch (Exception e)
         {
+            // LRCLIB / 官方都没拿到：再试公共源（GD Studio → 洛苏），仍然没有才报错
+            tries.Add("GD Studio/洛苏");
+            ArkLyricText alt = await PublicLyricAsync(song, artist);
+            if (alt != null)
+            {
+                string altFile = SaveLyric(string.Concat((artist.Trim() + "-" + song.Trim()).Select(c => char.IsLetterOrDigit(c) ? c : '_')), alt);
+                interactor.Poke(string.Join("\n", new[] {
+                    "歌词来源 " + alt.Source + "｜" + (alt.TimeSynced ? "带时间轴" : "纯文本") + "｜" + alt.Lines + " 行"
+                        + "（LRCLIB/官方没命中：" + e.Message + "）",
+                    altFile.Length > 0 ? "全文已存 " + altFile : "全文没写盘（写入失败，只回前若干行）",
+                    alt.Preview(14)
+                }));
+                return;
+            }
             interactor.Poke("❌ 取歌词失败（试过：" + string.Join("、", tries) + "）：" + e.Message
                 + "\n换写法再来一次：LRCLIB 认「歌手 歌名」，网易云要歌曲 id（https://music.163.com/song?id=xxx 里那串数字）");
         }
@@ -92,6 +108,18 @@ public partial class ShareArkModule
             List<ArkTrackInfo> hits = ArkFreeSources.ParseItunes(await GetJsonAsync(ArkFreeSources.ItunesSearchUrl(keyword), "itunes.apple.com"));
             if (hits.Count == 0)
             {
+                // iTunes 中文曲库不全：再用公共源补一次，命中就直接报，别让模型以为国内歌没有封面
+                List<ArkPublicSong> extra = await PublicCoverAsync(keyword);
+                if (extra.Count > 0)
+                {
+                    interactor.Poke("iTunes 没搜到「" + keyword + "」，公共源命中 " + Math.Min(take, extra.Count) + " 条：\n"
+                        + string.Join("\n", extra.Take(Math.Clamp(take, 1, 10)).Select((hit, i) =>
+                            (i + 1) + ". " + hit.Source + "：" + ArkFreeSources.SafeText(hit.Name, 80)
+                            + (hit.Artist.Length > 0 ? " - " + ArkFreeSources.SafeText(hit.Artist, 60) : "")
+                            + (hit.Album.Length > 0 ? " ｜专辑 " + ArkFreeSources.SafeText(hit.Album, 80) : "")
+                            + (hit.Cover.Length > 0 ? " ｜封面 " + hit.Cover : ""))));
+                    return;
+                }
                 interactor.Poke("iTunes 没搜到「" + keyword + "」。iTunes 的中文曲库不全，换英文歌名或「歌手 歌名」再试；"
                     + "国内平台的封面还是走各自的详情接口更准");
                 return;
@@ -108,7 +136,7 @@ public partial class ShareArkModule
 
     [XmlFunction(FunctionMode.OneShot)]
     [Description("给任意链接抓分享卡素材：自己下载页面解析 og/twitter/itemprop meta（不经过第三方）。"
-        + "拿不到标题时，若配置里开了 microlink 才走它兜底（那会把链接交给外部）")]
+        + "拿不到标题时，先试用 OIAPI 的网页信息接口，再试配置里开了的 microlink（这两个都会把链接交给外部）")]
     public async Task ArkLinkMeta(string url)
     {
         if (FreeGuard())
@@ -122,13 +150,34 @@ public partial class ShareArkModule
         try
         {
             ArkLinkInfo meta = ArkFreeSources.ParseOpenGraph(await GetHtmlAsync(url.Trim()), url.Trim());
-            if (meta.HasCard || !Configuration.EnableMicrolink)
+            if (meta.HasCard)
+            {
+                interactor.Poke(meta.Describe() + "\n拿着这些字段就能调 SendShareCard；标题为空时得自己写一个，别拿域名顶");
+                return;
+            }
+            // 自抓没拿到标题：先走 OIAPI（免 key、国内直连，只有文字），最后才轮到 microlink（境外，默认关）
+            if (Configuration.EnableOiApiMeta)
+            {
+                try
+                {
+                    ArkLinkInfo viaOi = ArkFreeSources.ParseOiApiWebInfo(
+                        await GetJsonAsync(ArkFreeSources.OiApiWebInfoUrl(url.Trim()), "oiapi.net"), url.Trim());
+                    interactor.Poke(viaOi.Describe()
+                        + "\n（自抓没拿到标题，用了 OIAPI 兜底——这条链接已经交给外部服务解析过；它只给文字，封面得自己补）");
+                    return;
+                }
+                catch (Exception oiError)
+                {
+                    logger.LogWarning("OIAPI 抓链接素材失败（{Url}）：{Msg}", url, oiError.Message);
+                }
+            }
+            if (!Configuration.EnableMicrolink)
             {
                 interactor.Poke(meta.Describe() + "\n拿着这些字段就能调 SendShareCard；标题为空时得自己写一个，别拿域名顶");
                 return;
             }
             ArkLinkInfo viaThird = ArkFreeSources.ParseMicrolink(await GetJsonAsync(ArkFreeSources.MicrolinkUrl(url.Trim()), "api.microlink.io"), url.Trim());
-            interactor.Poke(viaThird.Describe() + "\n（自抓没拿到标题，用了 microlink 兜底——这条链接已经交给外部服务解析过）");
+            interactor.Poke(viaThird.Describe() + "\n（自抓和 OIAPI 都没拿到标题，用了 microlink 兜底——这条链接已经交给外部服务解析过）");
         }
         catch (Exception e)
         {
@@ -138,10 +187,10 @@ public partial class ShareArkModule
     }
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("体检免费公开接口：LRCLIB 歌词（精确与搜索两种）、网易云官方歌词、iTunes、酷狗 v3、自抓 og 各打一次，逐项报可用性与原因")]
+    [Description("体检免费公开接口：LRCLIB 歌词（精确与搜索两种）、网易云官方歌词、iTunes、酷狗 v3、OIAPI 网页信息、自抓 og 各打一次，逐项报可用性与原因")]
     public async Task ArkFreeProbe()
     {
-        // 六项互不依赖，并发打；串行时一个国际站超时会把整份体检拖到几十秒
+        // 各项互不依赖，并发打；串行时一个国际站超时会把整份体检拖到几十秒
         Task<string>[] probes = new[]
         {
             TryJson(() => ArkFreeSources.LrclibSearchUrl("晴天 周杰伦"), "lrclib.net",
@@ -152,8 +201,8 @@ public partial class ShareArkModule
                 root => ArkFreeSources.ParseNeteaseLyric(root).Lines + " 行"),
             TryJson(() => ArkFreeSources.ItunesSearchUrl("周杰伦 晴天"), "itunes.apple.com",
                 root => { List<ArkTrackInfo> list = ArkFreeSources.ParseItunes(root); return list.Count > 0 ? list[0].Describe() : "没结果"; }),
-            TryJson(() => "https://mobilecdn.kugou.com/api/v3/search/song?format=json&pagesize=3&keyword=" + Uri.EscapeDataString("晴天"), "mobilecdn.kugou.com",
-                root => root.TryGetProperty("data", out JsonElement data) && data.TryGetProperty("info", out JsonElement info) ? info.GetArrayLength() + " 条" : "结构不对"),
+            TryKugouV3(),
+            TryOiApi(),
             TryHtml()
         };
         await Task.WhenAll(probes);
@@ -163,8 +212,9 @@ public partial class ShareArkModule
         lines.Add("· 网易云官方歌词：" + probes[2].Result);
         lines.Add("· iTunes 搜索：" + probes[3].Result);
         lines.Add("· 酷狗 v3（本插件容灾链里的一环）：" + probes[4].Result);
+        lines.Add(Configuration.EnableOiApiMeta ? "· OIAPI 网页信息（自抓没标题时的兜底）：" + probes[5].Result : "· OIAPI 网页信息：已关（自抓没标题时跳过它）");
         lines.Add(Configuration.EnableMicrolink ? "· microlink：已允许兜底（会把查询的链接交给外部服务）" : "· microlink：默认不用（开了才会把链接交给外部解析）");
-        lines.Add("自抓 og：" + probes[5].Result);
+        lines.Add("自抓 og：" + probes[6].Result);
         interactor.Poke(string.Join("\n", lines));
     }
 
@@ -239,6 +289,46 @@ public partial class ShareArkModule
             return "不通：" + e.Message;
         }
     }
+    async Task<string> TryKugouV3()
+    {
+        // mobilecdn.kugou.com 的 HTTPS 证书挂的是别的域名，握手必失败；搜歌那条路本来就有 http 兜底，
+        // 体检也要跟着试一遍，否则会把「实际能用」报成「不通」
+        string path = "api/v3/search/song?format=json&pagesize=3&keyword=" + Uri.EscapeDataString("晴天");
+        string last = "";
+        foreach (string scheme in new[] { "https", "http" })
+        {
+            try
+            {
+                JsonElement root = ParseJsonBody(await GetStringAsync(scheme + "://mobilecdn.kugou.com/" + path, "mobilecdn.kugou.com"));
+                if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("data", out JsonElement data)
+                    && data.TryGetProperty("info", out JsonElement info))
+                {
+                    return info.GetArrayLength() + " 条（" + scheme + "）";
+                }
+                last = "结构不对";
+            }
+            catch (Exception e)
+            {
+                last = e.Message;
+            }
+        }
+        return "不通：" + last;
+    }
+
+    async Task<string> TryOiApi()
+    {
+        try
+        {
+            ArkLinkInfo meta = ArkFreeSources.ParseOiApiWebInfo(
+                await GetJsonAsync(ArkFreeSources.OiApiWebInfoUrl("https://www.bilibili.com"), "oiapi.net"), "https://www.bilibili.com");
+            return "通（标题「" + meta.Title + "」）";
+        }
+        catch (Exception e)
+        {
+            return "不通：" + e.Message;
+        }
+    }
+
     async Task<string> TryHtml()
     {
         try

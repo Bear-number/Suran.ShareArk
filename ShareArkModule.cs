@@ -99,7 +99,7 @@ public class ShareArkConfig
     public string ExtraShareSignUrls { get; set; } = "";
 
     [DisplayName("容灾·启用公共音乐平台接口")]
-    [Description("免费、无需注册：洛苏API（网易云/QQ/酷狗点歌，详情带直链与封面）与糖豆子API（QQ 搜索）。官方音乐接口失败时自动补位。")]
+    [Description("免费、无需注册：洛苏API（网易云/QQ/酷狗点歌，详情带直链与封面）与糖豆子API（QQ 搜索）。签名站失败时先于官方接口补位。")]
     public bool EnablePublicMusicApis { get; set; } = true;
 
     [DisplayName("容灾·洛苏API基地址")]
@@ -109,6 +109,30 @@ public class ShareArkConfig
     [DisplayName("容灾·糖豆子API基地址")]
     [Description("免费公共 QQ 音乐搜索接口，默认 https://api.tangdouz.com；换镜像只改这里。")]
     public string TangDouZiBaseUrl { get; set; } = "https://api.tangdouz.com";
+
+    [DisplayName("容灾·启用 GD Studio 接口")]
+    [Description("免费、无需注册：网易云搜索、320k 直链、封面与歌词。官方与洛苏都拿不到时补位。")]
+    public bool EnableGdStudioMusic { get; set; } = true;
+
+    [DisplayName("容灾·GD Studio 接口地址")]
+    [Description("默认 https://music-api.gdstudio.xyz/api.php；换镜像只改这里。")]
+    public string GdStudioApiUrl { get; set; } = "https://music-api.gdstudio.xyz/api.php";
+
+    [DisplayName("容灾·启用 VKeys 接口")]
+    [Description("免费、无需注册：网易云与 QQ 的搜索列表（QQ 给 songmid）。只补搜索，不给直链。")]
+    public bool EnableVKeysMusic { get; set; } = true;
+
+    [DisplayName("容灾·VKeys 基地址")]
+    [Description("默认 https://api.vkeys.cn；换镜像只改这里。")]
+    public string VKeysBaseUrl { get; set; } = "https://api.vkeys.cn";
+
+    [DisplayName("容灾·启用酷我接口")]
+    [Description("免费、无需注册：搜索、mp3 直链、歌词与封面。曲库比网易云外层直链全，详情与歌词都会用它补位。")]
+    public bool EnableKuwoMusic { get; set; } = true;
+
+    [DisplayName("容灾·校验播放直链")]
+    [Description("发卡前探一下播放地址，不是音频就换成酷我/GD Studio 的直链，还拿不到就用详情页链接。")]
+    public bool VerifyMusicLink { get; set; } = true;
 
     // ── 功能开关：关闭后对应函数对AI不可用（默认全开，老配置缺省即开） ──
     [DisplayName("开关·搜歌")] [Description("关闭后 SearchMusic 不可用")]
@@ -137,6 +161,8 @@ public class ShareArkConfig
     public bool EnableFreeSources { get; set; } = true;
     [DisplayName("开关·允许 microlink 兜底")] [Description("自抓标题失败时是否用 microlink 解析，默认关。")]
     public bool EnableMicrolink { get; set; } = false;
+    [DisplayName("开关·允许 OIAPI 兜底")] [Description("自抓标题失败、microlink 又没开时，是否用 OIAPI 的网页信息接口解析，默认开。")]
+    public bool EnableOiApiMeta { get; set; } = true;
     [DisplayName("免费接口超时（秒）")] [Description("单个免费接口的超时；国际站直连经常不通，超时给短点别拖着整条链")]
     public int FreeSourceTimeoutSeconds { get; set; } = 12;
 }

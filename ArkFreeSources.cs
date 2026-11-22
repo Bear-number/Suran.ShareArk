@@ -91,6 +91,8 @@ public static class ArkFreeSources
     }
     /// <summary>microlink 会替你去访问那个链接，等于把你查的地址交给第三方，所以默认不用它</summary>
     public static string MicrolinkUrl(string url) => "https://api.microlink.io/?url=" + Uri.EscapeDataString(url);
+    /// <summary>OIAPI 的网页信息接口：免 key、国内直连，GET 与 POST 都认。只给 title/desc/favicon，没有大图</summary>
+    public static string OiApiWebInfoUrl(string url) => "https://oiapi.net/api/WebInfo?url=" + Uri.EscapeDataString(url);
     /// <summary>iTunes 给的是 100x100，它的 CDN 支持改尺寸；卡片封面要大的</summary>
     public static string Artwork(string artworkUrl100, int size = 600)
     {
@@ -260,6 +262,23 @@ public static class ArkFreeSources
             _ => m.Value
         });
     }
+    /// <summary>OIAPI WebInfo：code=1 且 data 里有标题才算成功；它只回 favicon，不能拿当封面</summary>
+    public static ArkLinkInfo ParseOiApiWebInfo(JsonElement root, string finalUrl)
+    {
+        if (root.ValueKind != JsonValueKind.Object || Number(root, "code") != 1
+            || root.TryGetProperty("data", out JsonElement data) == false || data.ValueKind != JsonValueKind.Object)
+        {
+            throw new Exception("OIAPI 没解析成功：" + (Text(root, "message").Length > 0 ? SafeText(Text(root, "message"), 80) : "返回里没有 data"));
+        }
+        string title = Text(data, "title").Trim();
+        if (title.Length == 0)
+        {
+            throw new Exception("OIAPI 回了空标题");
+        }
+        string site = Uri.TryCreate(finalUrl, UriKind.Absolute, out Uri host) ? host.Host : "";
+        return new ArkLinkInfo("OIAPI", title, Text(data, "desc"), "", site, finalUrl);
+    }
+
     public static ArkLinkInfo ParseMicrolink(JsonElement root, string finalUrl)
     {
         if (Text(root, "status") != "success" || root.TryGetProperty("data", out JsonElement data) == false)
