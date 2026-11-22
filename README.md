@@ -6,6 +6,8 @@
 
 - 站点探测：单个站点或全部站点探一遍可用性
 - 音乐：搜歌、发音乐卡片、取歌词与封面
+- 多源容灾：签名站失败时按洛苏、GD Studio、VKeys、酷我、OIAPI 的顺序补位
+- 直链探活：播放地址不是音频就换源，换不到就用详情页链接
 - 通用分享卡：标题、描述、图标，可指定跳转链接
 - 链接元信息抓取
 - B 站解析：视频信息、UP 主更新、扫码登录与 cookie 刷新
@@ -42,9 +44,15 @@
 | 容灾·公共音乐卡签名地址 | `BuiltinMusicArkUrl` | 默认 OIAPI 的 QQMusicJSONArk 接口；换服务时只改这一行。 | `"https://oiapi.net/api/QQMusicJSONArk"` |
 | 容灾·额外音乐卡签名地址 | `ExtraMusicSignUrls` | 完整地址，一行一个，可写 url\|key。适合 OIAPI 风格的第三方音乐卡签名（GET，参数 url/song/singer/cover/jump/format，format 用 163，成功码 0/200/1 都认）。 | `""` |
 | 容灾·额外分享卡签名地址 | `ExtraShareSignUrls` | 完整地址，一行一个，可写 url\|key。用于路径不标准的第三方分享卡签名（GET，参数 title/desc/url/preview/prompt，成功码 0/200）。 | `""` |
-| 容灾·启用公共音乐平台接口 | `EnablePublicMusicApis` | 免费、无需注册：洛苏API（网易云/QQ/酷狗点歌，详情带直链与封面）与糖豆子API（QQ 搜索）。官方音乐接口失败时自动补位。 | `true` |
+| 容灾·启用公共音乐平台接口 | `EnablePublicMusicApis` | 免费、无需注册：洛苏API（网易云/QQ/酷狗点歌，详情带直链与封面）与糖豆子API（QQ 搜索）。签名站失败时先于官方接口补位。 | `true` |
 | 容灾·洛苏API基地址 | `LuoSuBaseUrl` | 免费公共点歌接口，默认 https://api.luosu.top；换镜像只改这里。 | `"https://api.luosu.top"` |
 | 容灾·糖豆子API基地址 | `TangDouZiBaseUrl` | 免费公共 QQ 音乐搜索接口，默认 https://api.tangdouz.com；换镜像只改这里。 | `"https://api.tangdouz.com"` |
+| 容灾·启用 GD Studio 接口 | `EnableGdStudioMusic` | 免费、无需注册：网易云搜索、320k 直链、封面与歌词。官方与洛苏都拿不到时补位。 | `true` |
+| 容灾·GD Studio 接口地址 | `GdStudioApiUrl` | 默认 https://music-api.gdstudio.xyz/api.php；换镜像只改这里。 | `"https://music-api.gdstudio.xyz/api.php"` |
+| 容灾·启用 VKeys 接口 | `EnableVKeysMusic` | 免费、无需注册：网易云与 QQ 的搜索列表（QQ 给 songmid）。只补搜索，不给直链。 | `true` |
+| 容灾·VKeys 基地址 | `VKeysBaseUrl` | 默认 https://api.vkeys.cn；换镜像只改这里。 | `"https://api.vkeys.cn"` |
+| 容灾·启用酷我接口 | `EnableKuwoMusic` | 免费、无需注册：搜索、mp3 直链、歌词与封面。曲库比网易云外层直链全，详情与歌词都会用它补位。 | `true` |
+| 容灾·校验播放直链 | `VerifyMusicLink` | 发卡前探一下播放地址，不是音频就换成酷我/GD Studio 的直链，还拿不到就用详情页链接。 | `true` |
 | 开关·搜歌 | `EnableSearchMusic` | 关闭后 SearchMusic 不可用 | `true` |
 | 开关·发音乐/视频卡 | `EnableSendArkCard` | 关闭后 SendArkCard 不可用 | `true` |
 | 开关·发通用分享卡 | `EnableSendShareCard` | 关闭后 SendShareCard 不可用 | `true` |
@@ -58,4 +66,5 @@
 | 开关·列出全部接口 | `EnableProbeAll` | 关闭后 ProbeAll 不可用 | `true` |
 | 开关·免费公开接口 | `EnableFreeSources` | 歌词走 LRCLIB 与网易云官方、封面与试听走 iTunes、通用链接卡自己抓页面 meta 解析；全部免注册免 key | `true` |
 | 开关·允许 microlink 兜底 | `EnableMicrolink` | 自抓标题失败时是否用 microlink 解析，默认关。 | `false` |
+| 开关·允许 OIAPI 兜底 | `EnableOiApiMeta` | 自抓标题失败、microlink 又没开时，是否用 OIAPI 的网页信息接口解析，默认开。 | `true` |
 | 免费接口超时（秒） | `FreeSourceTimeoutSeconds` | 单个免费接口的超时；国际站直连经常不通，超时给短点别拖着整条链 | `12` |
