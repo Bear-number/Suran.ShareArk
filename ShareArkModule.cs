@@ -169,10 +169,10 @@ public class ShareArkConfig
     public bool EnableProbeAll { get; set; } = true;
     [DisplayName("开关·免费公开接口")] [Description("歌词走 LRCLIB 与网易云官方、封面与试听走 iTunes、通用链接卡自己抓页面 meta 解析；全部免注册免 key")]
     public bool EnableFreeSources { get; set; } = true;
-    [DisplayName("开关·允许 microlink 兜底")] [Description("自抓标题失败时是否用 microlink 解析，默认关。")]
-    public bool EnableMicrolink { get; set; } = false;
     [DisplayName("开关·允许 OIAPI 兜底")] [Description("自抓标题失败、microlink 又没开时，是否用 OIAPI 的网页信息接口解析，默认开。")]
     public bool EnableOiApiMeta { get; set; } = true;
+    [DisplayName("开关·允许 microlink 兜底")] [Description("自抓标题失败时是否用 microlink 解析，默认关。")]
+    public bool EnableMicrolink { get; set; } = false;
     [DisplayName("免费接口超时（秒）")] [Description("单个免费接口的超时；国际站直连经常不通，超时给短点别拖着整条链")]
     public int FreeSourceTimeoutSeconds { get; set; } = 12;
 }

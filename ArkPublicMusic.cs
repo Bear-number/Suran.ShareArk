@@ -30,9 +30,10 @@ public static class ArkPublicMusic
     public const string KuwoLyricBase = "https://m.kuwo.cn";
     public const string KuwoImageBase = "https://img1.kuwo.cn";
 
+    // rn 小于 3 时酷我只回分页头、不给 abslist，所以下限压到 3
     public static string KuwoSearchUrl(string keyword, int count)
         => KuwoSearchBase + "/r.s?client=kt&all=" + Uri.EscapeDataString(keyword)
-           + "&pn=0&rn=" + Math.Clamp(count, 1, 20).ToString(CultureInfo.InvariantCulture)
+           + "&pn=0&rn=" + Math.Clamp(count, 3, 20).ToString(CultureInfo.InvariantCulture)
            + "&uid=&vipver=1&show_copyright_off=1&pcvipver=1&encoding=utf8&rformat=json&mobi=1";
 
     /// <summary>rid 用 musicRid（MUSIC_数字），回的是纯文本直链</summary>

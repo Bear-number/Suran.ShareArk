@@ -248,15 +248,15 @@ public partial class ShareArkModule
         }
         if (Configuration.EnableKuwoMusic)
         {
-            List<ArkPublicSong> kuwo = await KuwoSearchAsync("晴天", 1);
-            if (kuwo.Count == 0)
+            // 酷我按「晴天」搜出来的第一条是无关音频，用歌名+歌手走严格匹配才问得准
+            (ArkPublicSong kuwoHit, string kuwoPlay) = await KuwoPickAsync("晴天", "周杰伦", 5);
+            if (kuwoHit == null)
             {
                 parts.Add("酷我 不通");
             }
             else
             {
-                string play = await KuwoPlayUrlAsync(kuwo[0].Id);
-                parts.Add("酷我 " + (play.Length > 0 ? "通（搜到 " + kuwo[0].Name + "，有直链）" : "搜索通但没给直链"));
+                parts.Add("酷我 " + (kuwoPlay.Length > 0 ? "通（搜到 " + kuwoHit.Name + "，有直链）" : "搜索通但没给直链"));
             }
         }
         else
