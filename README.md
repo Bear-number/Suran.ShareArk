@@ -43,7 +43,7 @@
 | B站搜索接口地址 | `BiliSearchUrl` | B站视频搜索接口完整地址，留空走官方接口。 | `""` |
 | 容灾·签名失败冷却秒 | `SignFailureCooldownSeconds` | 签名接口报错后，这么多秒内不再重试（直接走备用方案），避免每次点歌都白等三四秒。0 = 每次都试 | `300` |
 | 容灾·启用官方接口回退 | `EnableOfficialFallback` | 第三方接口失败时是否自动改用官方接口。 | `true` |
-| 容灾·备用签名基地址 | `BackupBaseUrls` |  | `""` |
+| 容灾·备用签名基地址 | `BackupBaseUrls` | 主站失败后按顺序尝试。多个用逗号或换行分隔；每个可写成 base\|key（key 留空则沿用上面的 ApiKey）。适合再填一家同协议（qq-musicArk / qq-shareArk / *-music-search）的签名站。 | `""` |
 | 容灾·启用公共音乐卡签名 | `EnableBuiltinMusicSign` | 主站与备用站都失败时，音乐卡再试 OIAPI 公共签名（免 key，实测可用）。分享卡没有公共备用，仍走图文兜底。 | `true` |
 | 容灾·公共音乐卡签名地址 | `BuiltinMusicArkUrl` | 默认 OIAPI 的 QQMusicJSONArk 接口；换服务时只改这一行。 | `"https://oiapi.net/api/QQMusicJSONArk"` |
 | 容灾·额外音乐卡签名地址 | `ExtraMusicSignUrls` | 完整地址，一行一个，可写 url\|key。适合 OIAPI 风格的第三方音乐卡签名（GET，参数 url/song/singer/cover/jump/format，format 用 163，成功码 0/200/1 都认）。 | `""` |
@@ -74,6 +74,6 @@
 | 开关·探测接口 | `EnableProbeBase` | 关闭后 ProbeBase 不可用 | `true` |
 | 开关·列出全部接口 | `EnableProbeAll` | 关闭后 ProbeAll 不可用 | `true` |
 | 开关·免费公开接口 | `EnableFreeSources` | 歌词走 LRCLIB 与网易云官方、封面与试听走 iTunes、通用链接卡自己抓页面 meta 解析；全部免注册免 key | `true` |
-| 开关·允许 microlink 兜底 | `EnableMicrolink` | 自抓标题失败时是否用 microlink 解析，默认关。 | `false` |
 | 开关·允许 OIAPI 兜底 | `EnableOiApiMeta` | 自抓标题失败、microlink 又没开时，是否用 OIAPI 的网页信息接口解析，默认开。 | `true` |
+| 开关·允许 microlink 兜底 | `EnableMicrolink` | 自抓标题失败时是否用 microlink 解析，默认关。 | `false` |
 | 免费接口超时（秒） | `FreeSourceTimeoutSeconds` | 单个免费接口的超时；国际站直连经常不通，超时给短点别拖着整条链 | `12` |
