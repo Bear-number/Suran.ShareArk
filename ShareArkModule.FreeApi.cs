@@ -278,6 +278,14 @@ public partial class ShareArkModule
         FetchResult result = await SafeFetchAsync(url, referer, timeout, false);
         return DecodeBody(result.Bytes, result.ContentType);
     }
+
+    /// <summary>需要指定 Referer 的接口（豆瓣要求来源页、快递100 拦裸请求），Referer 表里放不下按域名区分的场景就走这个。</summary>
+    async Task<string> GetTextWithRefererAsync(string url, string referer)
+    {
+        TimeSpan timeout = TimeSpan.FromSeconds(Math.Clamp(Configuration.FreeSourceTimeoutSeconds, 3, 90));
+        FetchResult result = await SafeFetchAsync(url, referer, timeout, false);
+        return DecodeBody(result.Bytes, result.ContentType);
+    }
     async Task<string> TryJson(Func<string> url, string host, Func<JsonElement, string> read)
     {
         try

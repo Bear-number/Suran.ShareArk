@@ -153,6 +153,16 @@ public class ShareArkConfig
     public bool EnableBiliCookie { get; set; } = true;
     [DisplayName("开关·IP查询")] [Description("关闭后 IpLookup 不可用")]
     public bool EnableIpLookup { get; set; } = true;
+    [DisplayName("开关·豆瓣影视图书")] [Description("关闭后 ArkDouban 不可用")]
+    public bool EnableDouban { get; set; } = true;
+    [DisplayName("开关·热榜")] [Description("关闭后 ArkHotList 不可用")]
+    public bool EnableHotList { get; set; } = true;
+    [DisplayName("开关·快递查询")] [Description("关闭后 ArkExpress 不可用")]
+    public bool EnableExpress { get; set; } = true;
+    [DisplayName("开关·天气")] [Description("关闭后 ArkWeather 不可用")]
+    public bool EnableWeather { get; set; } = true;
+    [DisplayName("天气·默认城市")] [Description("没指定城市时查这里，默认北京")]
+    public string WeatherDefaultCity { get; set; } = "北京";
     [DisplayName("开关·探测接口")] [Description("关闭后 ProbeBase 不可用")]
     public bool EnableProbeBase { get; set; } = true;
     [DisplayName("开关·列出全部接口")] [Description("关闭后 ProbeAll 不可用")]
