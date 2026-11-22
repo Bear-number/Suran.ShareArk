@@ -1,6 +1,6 @@
 # Suran.ShareArk
 
-把链接变成好看的卡片：探测站点、生成 ARK 分享卡，B 站链接自动解析。
+把链接变成好看的卡片：探测站点、生成 ARK 分享卡，B 站链接自动解析，另带影视、热榜、快递与天气查询。
 
 ## 功能
 
@@ -13,6 +13,10 @@
 - B 站解析：视频信息、UP 主更新、扫码登录与 cookie 刷新
 - IP 归属地查询
 - 按平台生成对应卡片
+- 豆瓣影视、图书、音乐条目：评分、导演或作者、简介、海报，可按名字找条目
+- 热榜：抖音、百度、B 站榜单
+- 快递轨迹：按单号自动识别快递公司
+- 天气：实况加未来三天预报，可发天气卡
 
 ## 安装
 
@@ -62,6 +66,11 @@
 | 开关·Cookie刷新 | `EnableBiliCookieRefresh` | 关闭后 BiliCookieRefresh 不可用 | `true` |
 | 开关·Cookie管理 | `EnableBiliCookie` | 关闭后 BiliCookie 不可用 | `true` |
 | 开关·IP查询 | `EnableIpLookup` | 关闭后 IpLookup 不可用 | `true` |
+| 开关·豆瓣影视图书 | `EnableDouban` | 关闭后 ArkDouban 不可用 | `true` |
+| 开关·热榜 | `EnableHotList` | 关闭后 ArkHotList 不可用 | `true` |
+| 开关·快递查询 | `EnableExpress` | 关闭后 ArkExpress 不可用 | `true` |
+| 开关·天气 | `EnableWeather` | 关闭后 ArkWeather 不可用 | `true` |
+| 天气·默认城市 | `WeatherDefaultCity` | 没指定城市时查这里，默认北京 | `"北京"` |
 | 开关·探测接口 | `EnableProbeBase` | 关闭后 ProbeBase 不可用 | `true` |
 | 开关·列出全部接口 | `EnableProbeAll` | 关闭后 ProbeAll 不可用 | `true` |
 | 开关·免费公开接口 | `EnableFreeSources` | 歌词走 LRCLIB 与网易云官方、封面与试听走 iTunes、通用链接卡自己抓页面 meta 解析；全部免注册免 key | `true` |
