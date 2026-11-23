@@ -1263,53 +1263,6 @@ public partial class ShareArkModule
         return root.TryGetProperty("data", out JsonElement dataElement) ? dataElement.Clone() : JsonDocument.Parse("null").RootElement.Clone();
     }
 
-    // ---- WBI 签名（用户信息/投稿搜索接口需要） ----
-    static readonly int[] WbiMixinTable = { 46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52 };
-    string wbiMixinKey = "";
-    DateTime wbiKeyFetchedTime = DateTime.MinValue;
-
-    async Task<string> GetWbiMixinKeyAsync()
-    {
-        if (wbiMixinKey.Length > 0 && (DateTime.Now - wbiKeyFetchedTime).TotalHours < 24)
-        {
-            return wbiMixinKey;
-        }
-        JsonElement nav = await BiliOfficialGetAsync(BiliApiBase + "/x/web-interface/nav");
-        JsonElement wbiImg = nav.GetProperty("wbi_img");
-        string imgKey = GetStringField(wbiImg, "img_url").Split('/').Last().Split('.')[0];
-        string subKey = GetStringField(wbiImg, "sub_url").Split('/').Last().Split('.')[0];
-        string rawKey = imgKey + subKey;
-        char[] mixin = new char[32];
-        for (int i = 0; i < 32; i++)
-        {
-            mixin[i] = rawKey[WbiMixinTable[i]];
-        }
-        wbiMixinKey = new string(mixin);
-        wbiKeyFetchedTime = DateTime.Now;
-        return wbiMixinKey;
-    }
-
-    static string Md5Hex(string text)
-    {
-        return Convert.ToHexString(MD5.HashData(Encoding.UTF8.GetBytes(text))).ToLowerInvariant();
-    }
-
-    static string FilterWbiValue(string value)
-    {
-        return Regex.Replace(value, "[!'()*]", "");
-    }
-
-    // 对参数做 WBI 签名，返回带 w_rid/wts 的最终查询串
-    async Task<string> BuildWbiQueryAsync(Dictionary<string, string> parameters)
-    {
-        string mixinKey = await GetWbiMixinKeyAsync();
-        parameters["wts"] = DateTimeOffset.Now.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
-        string query = string.Join("&", parameters
-            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
-            .Select(pair => Uri.EscapeDataString(pair.Key) + "=" + Uri.EscapeDataString(FilterWbiValue(pair.Value))));
-        return query + "&w_rid=" + Md5Hex(query + mixinKey);
-    }
-
     // ---- BiliParse 官方实现：URL解析 + view 详情 + playurl 直链 ----
     async Task<string> OfficialBiliParseAsync(string url, string action, int? qn)
     {
