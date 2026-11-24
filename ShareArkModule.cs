@@ -83,7 +83,7 @@ public class ShareArkConfig
     public string BackupBaseUrls { get; set; } = "";
 
     [DisplayName("容灾·启用公共音乐卡签名")]
-    [Description("主站与备用站都失败时，音乐卡再试 OIAPI 公共签名（免 key，实测可用）。分享卡没有公共备用，仍走图文兜底。")]
+    [Description("主站与备用站都失败时，音乐卡再试 OIAPI 公共签名（免 key，可用）。分享卡没有公共备用，仍走图文兜底。")]
     public bool EnableBuiltinMusicSign { get; set; } = true;
 
     [DisplayName("容灾·公共音乐卡签名地址")]
