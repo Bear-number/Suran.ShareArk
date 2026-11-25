@@ -221,8 +221,20 @@ public static class ArkFreeSources
     public static ArkLinkInfo ParseOpenGraph(string html, string finalUrl)
     {
         string text = html ?? "";
-        return new ArkLinkInfo("自抓 og", First(text, TitlePatterns), First(text, DescPatterns), First(text, ImagePatterns),
+        return new ArkLinkInfo("自抓 og", First(text, TitlePatterns), First(text, DescPatterns),
+            Absolute(First(text, ImagePatterns), finalUrl),
             First(text, new[] { SitePattern }), finalUrl);
+    }
+
+    /// <summary>页面里的封面常写成 //cdn.x/a.jpg 或 /a.jpg；签名端只认带 http(s) 的绝对地址，相对的先补全。</summary>
+    public static string Absolute(string url, string baseUrl)
+    {
+        if (string.IsNullOrWhiteSpace(url) || url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        {
+            return url ?? "";
+        }
+        // [静默] 解析失败按无此项处理
+        try { return new Uri(new Uri(baseUrl), url.Trim()).ToString(); } catch { return ""; }
     }
     static string First(string html, Regex[] patterns)
     {

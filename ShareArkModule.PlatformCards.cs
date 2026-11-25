@@ -13,7 +13,7 @@ namespace Suran.ShareArk;
 /// 「更多平台卡」：把抖音/小红书/微博/知乎/Steam/GitHub 这类链接，按平台抓出标题、简介、封面，
 /// 再交给通用的分享卡签名链路发出。Steam 与 GitHub 走官方公开接口（信息最准），
 /// 其余平台按页面 meta 解析，抓不到就退回现有的 FetchMetaAsync。
-/// B 站不走这里：视频卡用 SearchBili + SendArkCard，解析用 BiliParse。
+/// B 站视频/番剧走 ark 卡；主页、动态、专栏没有专用卡，照走通用分享卡。
 /// </summary>
 public partial class ShareArkModule
 {

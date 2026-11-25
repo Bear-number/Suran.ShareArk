@@ -182,7 +182,7 @@ public partial class ShareArkModule
         catch (Exception e)
         {
             interactor.Poke("❌ 抓链接素材失败：" + e.Message
-                + "\n有些站（B站视频页这类）没有标准 og 标签，改用 ArkCover/官方详情接口拿图，或让主人自己给标题");
+                + "\n有些站（B站视频页这类）没有标准 og 标签，改用 ArkCover/官方详情接口拿图，或让用户自己给标题");
         }
     }
 

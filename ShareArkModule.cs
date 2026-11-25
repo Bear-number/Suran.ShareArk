@@ -26,7 +26,7 @@ namespace Suran.ShareArk;
 public class ShareArkConfig
 {
     [DisplayName("运行·功能文档常驻")]
-    [Description("开：功能说明常驻系统提示词，模型随时看得到工具；关：隐式加载省 token，模型先输出入口标签再读文档。发卡片/解析链接多是主人明确要求时用，默认关")]
+    [Description("开：功能说明常驻系统提示词，模型随时看得到工具；关：隐式加载省 token，模型先输出入口标签再读文档。发卡片/解析链接多是用户明确要求时用，默认关")]
     public bool DocumentAlwaysResident { get; set; } = false;
 
     [DisplayName("第三方接口基地址")]
@@ -1043,8 +1043,11 @@ public partial class ShareArkModule(
     {
         XmlHandler handler = new(this)
         {
-            Description = "把网页链接或歌曲/视频做成QQ分享卡片并发送，并提供B站链接解析/UP主更新/扫码登录；另有免key的歌词/封面/链接素材公开接口。",
+            Description = "把链接、歌曲、视频做成 QQ 分享卡片发出去时用；"
+                + "B站播放直链/番剧/专栏解析、UP主更新、扫码登录、搜歌、豆瓣/热榜/天气/快递/IP 查询、免 key 的歌词封面也在这里。",
             Explanation = "搜歌用 SearchMusic，发卡用 SendArkCard / SendShareCard；B站系列：BiliParse 解析链接（**播放直链、b23短链、专栏/番剧/直播间只有这里有**）、BiliUpdates 查UP主更新、BiliQrLogin 扫码登录（**这是本插件第三方接口的凭据池，不是你本机的B站账号**）、BiliCookieRefresh 刷新登录态、BiliCookie 管理登录Cookie；IpLookup 查IP归属。这些都要已配置第三方基地址和ApiKey。"
+                + "SendPlatformCard 给一个链接就按平台抓标题封面发卡（B站/抖音/快手/西瓜/腾讯视频/爱奇艺/优酷/YouTube/TikTok/小红书/微博/知乎/微信/Twitter/Instagram/Steam/GitHub 及任意网页）；"
+                + "ArkDouban 查豆瓣影视图书、ArkHotList 看热榜（抖音/百度/B站）、ArkWeather 查天气、ArkExpress 查快递。"
                 + "搜索B站视频、查视频详情、查UP主资料、看热门榜，一律用 Suran.Bili 插件的 BiliSearch / BiliVideo / BiliUser / BiliHot（走本机 cookie，结果与你在B站看到的一致，也没有第三方限额）；本插件不再提供这些，只留发卡片和上面那些 Suran.Bili 没有的能力。"
                 + "ProbeBase 探测三个签名/搜索接口通不通，ProbeAll 列出基地址下发现的所有接口。"
                 + "另一批不要 key、不要配置的走公开接口：ArkLyric 取歌词（LRCLIB 与网易云官方）、ArkCover 找封面与试听（iTunes）、ArkLinkMeta 自己抓页面 meta 出卡片素材、ArkFreeProbe 体检这些源。"

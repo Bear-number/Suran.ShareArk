@@ -670,7 +670,7 @@ public partial class ShareArkModule
     }
 
     [XmlFunction(FunctionMode.OneShot, order: -1)]
-    [Description("把任意网页链接拼成QQ分享卡发出（通用链接卡，走分享卡签名接口）。title标题，desc描述，url跳转链接，preview预览图可留空，prompt提示文本可留空，type不填默认group")]
+    [Description("把任意网页链接拼成QQ分享卡发出（通用链接卡，走分享卡签名接口）。title标题，desc描述，url跳转链接，preview预览图可留空，prompt提示文本可留空，type不填默认group。B站主页/动态/专栏也能发；B站视频和番剧有专用卡，用 SendArkCard 或 SendPlatformCard")]
     public async Task SendShareCard(
         [Description("跳转链接")] string url,
         [Description("卡片标题，可留空，留空自动抓")] string title = null,
@@ -696,12 +696,16 @@ public partial class ShareArkModule
         {
             // 链接是用户给的：先确认是公网 http/https，再往下抓页面/发卡
             await VerifyPublicUriAsync(url);
-            // 过滤B站链接：B站走专用搜索+音乐卡接口，不走通用分享卡
+            // B站只挡「链接里认得出视频/番剧 ID」的那种——它有专用 ark 卡，画面和集数信息比通用卡全。
+            // 主页、动态、专栏、收藏夹、直播间没有专用卡，照走通用卡，否则这些页永远发不出去。
             string host = "";
             // [静默] 解析失败按无此项处理
             try { host = new Uri(url).Host.ToLowerInvariant(); } catch { }
-                if (allowBili == false && (host.Contains("bilibili.com") || host.Contains("b23.tv") || host.Contains("biligame.com")) && !host.StartsWith("live."))
-                    throw new Exception("B站视频/主页链接不走自定义卡，用 SearchBili 拿BV号再 SendArkCard，或用 BiliParse 解析这个链接，直播可直接发");
+            // [静默] 同上
+            string biliId = "";
+            try { biliId = BiliVideoId(url); } catch { }
+            if (allowBili == false && IsBiliHost(host) && biliId.Length > 0)
+                throw new Exception("这是 B站视频/番剧链接，有专用卡：" + biliId + " 用 SendArkCard platform=\"bilibili\" 发，或直接发 SendPlatformCard 传原链接；主页、动态、专栏照常用本卡");
 
             // 免费源开关关掉后，发卡就不能再偷偷抓页面：只用调用方给的标题/描述/预览
             var meta = Configuration.EnableFreeSources ? await FetchMetaAsync(url) : new PageMeta();
@@ -713,6 +717,10 @@ public partial class ShareArkModule
             if (string.IsNullOrWhiteSpace(desc)) desc = title;
             if (string.IsNullOrWhiteSpace(prompt))
                 prompt = "[分享]" + title;
+            // 签名端把 preview 当必填且只认绝对地址：//cdn.x/a.jpg、/a.jpg 这类先补全，补不出来就退站点 favicon
+            preview = ArkFreeSources.Absolute(preview, url);
+            if (preview.Length == 0)
+                preview = ArkFreeSources.Absolute("/favicon.ico", url);
             // 依次尝试主站 / 备用站；全失败才抛给下面的文本兜底
             string card = await SignShareCardAsync(title, desc, url, preview, prompt);
             (bool Success, string Message, bool Definite) sent = await SendJsonDetailedAsync(target, isGroup, card);
@@ -771,6 +779,33 @@ public partial class ShareArkModule
         }
     }
 
+    /// <summary>B站域名。直播（live.）不算——直播间本来就走通用卡。</summary>
+    static bool IsBiliHost(string host)
+    {
+        if (host.Length == 0 || host.StartsWith("live.", StringComparison.Ordinal))
+        {
+            return false;
+        }
+        return host.Contains("bilibili.com") || host.Contains("b23.tv") || host.Contains("biligame.com");
+    }
+
+    /// <summary>链接里能认出视频/番剧 ID 就返回（BV 号、av 号、ep/ss 号），认不出（主页、动态、专栏）返回空串。</summary>
+    static string BiliVideoId(string url)
+    {
+        Match bv = Regex.Match(url ?? "", "BV[0-9A-Za-z]{10}");
+        if (bv.Success)
+        {
+            return bv.Value;
+        }
+        Match av = Regex.Match(url ?? "", @"/video/av(\d{6,})", RegexOptions.IgnoreCase);
+        if (av.Success)
+        {
+            return "av" + av.Groups[1].Value;
+        }
+        Match season = Regex.Match(url ?? "", @"/bangumi/(?:play|media)/((?:ep|ss)\d+)", RegexOptions.IgnoreCase);
+        return season.Success ? season.Groups[1].Value : "";
+    }
+
     // 分享卡多节点签名：主站 → 备用站；某个节点失败只冷却自己，不影响后面的节点
     async Task<string> SignShareCardAsync(string title, string desc, string url, string preview, string prompt)
     {
@@ -823,14 +858,27 @@ public partial class ShareArkModule
             }
             string query = string.Join("&", q.Select(kv => Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value ?? "")));
             string full = WithQuery(node.Url, query);
-            string body;
+            HttpResponseMessage response;
             try
             {
-                body = await Http.GetStringAsync(full);
+                response = await Http.GetAsync(full);
             }
             catch (Exception requestError)
             {
                 throw new Exception("连不上：" + requestError.Message);
+            }
+            string body;
+            using (response)
+            {
+                body = await response.Content.ReadAsStringAsync();
+                if (response.IsSuccessStatusCode == false)
+                {
+                    // 非 2xx 时正文里才是服务端的原因（400 就是「缺少必要参数」），
+                    // 丢掉正文字报成「连不上」只会把人往网络问题上带
+                    logger.LogWarning("分享卡节点 {Node} HTTP {Code}：{Body} | {Url}",
+                        node.Name, (int)response.StatusCode, Brief(body, 200), MaskKey(full));
+                    throw new Exception("HTTP " + (int)response.StatusCode + "：" + Brief(body, 160));
+                }
             }
             using JsonDocument doc = JsonDocument.Parse(body);
             if (Ok(doc.RootElement))
@@ -1073,7 +1121,7 @@ public partial class ShareArkModule
 
 
     [XmlFunction(FunctionMode.OneShot)]
-    [Description("【第三方接口的凭据，不是你的B站账号】扫码登录后拿到 cookie_id，供 ShareArk 的第三方接口调用使用。要登录本机B站账号（收藏/历史/动态等）请用 Suran.Bili 的 BiliLogin。action=generate 申请二维码（把二维码链接只发给主人本人），action=poll 用 qrcode_key 查状态")]
+    [Description("【第三方接口的凭据，不是你的B站账号】扫码登录后拿到 cookie_id，供 ShareArk 的第三方接口调用使用。要登录本机B站账号（收藏/历史/动态等）请用 Suran.Bili 的 BiliLogin。action=generate 申请二维码（把二维码链接只发给用户本人），action=poll 用 qrcode_key 查状态")]
     public async Task BiliQrLogin(
         [Description("generate=申请二维码 / poll=轮询登录状态")] string action,
         [Description("action=poll时填 generate 返回的 qrcode_key")] string qrcodeKey = null)
