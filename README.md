@@ -30,7 +30,8 @@
 
 | 设置项 | 键 | 说明 | 默认 |
 | --- | --- | --- | --- |
-| 运行·功能文档常驻 | `DocumentAlwaysResident` | 开：功能说明常驻系统提示词，模型随时看得到工具；关：隐式加载省 token，模型先输出入口标签再读文档。发卡片/解析链接多是主人明确要求时用，默认关 | `false` |
+| UiTheme | `UiTheme` | 界面主题：pink = 粉色（默认），dark = 黑夜。 | `"pink"` |
+| 运行·功能文档常驻 | `DocumentAlwaysResident` | 开：功能说明常驻系统提示词，模型随时看得到工具；关：隐式加载省 token，模型先输出入口标签再读文档。发卡片/解析链接多是用户明确要求时用，默认关 | `false` |
 | 第三方接口基地址 | `BaseUrl` | 第三方签名服务基地址。 | `""` |
 | 接口Token | `ApiKey` | 第三方接口凭证 key，可留空。 | `""` |
 | 网络·代理地址 | `ProxyUrl` | 出站请求走这个代理，支持 http:// 与 socks5://；留空直连。境外平台（YouTube/Spotify/Apple Music/X）抓不到时填这里，改完不用重载插件 | `""` |
@@ -44,7 +45,7 @@
 | 容灾·签名失败冷却秒 | `SignFailureCooldownSeconds` | 签名接口报错后，这么多秒内不再重试（直接走备用方案），避免每次点歌都白等三四秒。0 = 每次都试 | `300` |
 | 容灾·启用官方接口回退 | `EnableOfficialFallback` | 第三方接口失败时是否自动改用官方接口。 | `true` |
 | 容灾·备用签名基地址 | `BackupBaseUrls` | 主站失败后按顺序尝试。多个用逗号或换行分隔；每个可写成 base\|key（key 留空则沿用上面的 ApiKey）。适合再填一家同协议（qq-musicArk / qq-shareArk / *-music-search）的签名站。 | `""` |
-| 容灾·启用公共音乐卡签名 | `EnableBuiltinMusicSign` | 主站与备用站都失败时，音乐卡再试 OIAPI 公共签名（免 key，实测可用）。分享卡没有公共备用，仍走图文兜底。 | `true` |
+| 容灾·启用公共音乐卡签名 | `EnableBuiltinMusicSign` | 主站与备用站都失败时，音乐卡再试 OIAPI 公共签名（免 key，可用）。分享卡没有公共备用，仍走图文兜底。 | `true` |
 | 容灾·公共音乐卡签名地址 | `BuiltinMusicArkUrl` | 默认 OIAPI 的 QQMusicJSONArk 接口；换服务时只改这一行。 | `"https://oiapi.net/api/QQMusicJSONArk"` |
 | 容灾·额外音乐卡签名地址 | `ExtraMusicSignUrls` | 完整地址，一行一个，可写 url\|key。适合 OIAPI 风格的第三方音乐卡签名（GET，参数 url/song/singer/cover/jump/format，format 用 163，成功码 0/200/1 都认）。 | `""` |
 | 容灾·额外分享卡签名地址 | `ExtraShareSignUrls` | 完整地址，一行一个，可写 url\|key。用于路径不标准的第三方分享卡签名（GET，参数 title/desc/url/preview/prompt，成功码 0/200）。 | `""` |
